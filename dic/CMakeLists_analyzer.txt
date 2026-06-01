@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.23)
+project(memory_analyzer)
+add_executable(memory_analyzer memory_analyzer.cpp)
+set_property(TARGET memory_analyzer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+
+
