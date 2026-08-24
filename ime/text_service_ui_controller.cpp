@@ -1,6 +1,10 @@
 ﻿#include "text_service.h"
 
+#include "ime_trace.h"
+#include "perf_trace.h"
+
 #include <Windows.h>
+#include <shellapi.h>
 #include <map>
 #include <algorithm>
 #include <commdlg.h>
@@ -28,6 +32,23 @@ constexpr auto CREATE_WORD_EDIT_BRUSH_PROP = L"zime_create_word_edit_brush";
 constexpr UINT WM_CREATE_WORD_APPLY_LAYOUT = WM_APP + 101;
 constexpr int CANDIDATE_FONT_BOOST_PERCENT = 10;
 
+bool prefer_in_process_shell_candidate_window()
+{
+    static const bool prefer_local = []
+    {
+        wchar_t path[32768] = {};
+        const DWORD length = GetModuleFileNameW(
+            nullptr, path, static_cast<DWORD>(std::size(path)));
+        if (length == 0 || length >= std::size(path))
+            return false;
+        const wchar_t* name = wcsrchr(path, L'\\');
+        name = name ? name + 1 : path;
+        return _wcsicmp(name, L"SearchHost.exe") == 0 ||
+            _wcsicmp(name, L"SearchApp.exe") == 0;
+    }();
+    return prefer_local;
+}
+
 UINT resolve_window_dpi(HWND hwnd)
 {
     using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
@@ -50,39 +71,15 @@ bool is_shift_vk(WPARAM vk)
 
 bool is_likely_fullscreen_foreground_window()
 {
-    HWND hwnd = GetForegroundWindow();
-    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd))
+    QUERY_USER_NOTIFICATION_STATE state = QUNS_NOT_PRESENT;
+    if (FAILED(SHQueryUserNotificationState(&state)))
         return false;
 
-    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    if ((style & WS_CHILD) != 0)
-        return false;
-
-    RECT wr = {};
-    if (!GetWindowRect(hwnd, &wr))
-        return false;
-
-    const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    if (!monitor)
-        return false;
-
-    MONITORINFO mi = {};
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(monitor, &mi))
-        return false;
-
-    const RECT mr = mi.rcMonitor;
-    constexpr int tol = 2;
-    const bool covers_monitor =
-        wr.left <= mr.left + tol &&
-        wr.top <= mr.top + tol &&
-        wr.right >= mr.right - tol &&
-        wr.bottom >= mr.bottom - tol;
-    if (!covers_monitor)
-        return false;
-
-    const bool borderless = (style & WS_CAPTION) == 0 && (style & WS_THICKFRAME) == 0;
-    return borderless;
+    // Geometry/style tests misclassify maximized custom-titlebar apps such as
+    // VS Code and modern Notepad.  These two states are the system's explicit
+    // signal that nonessential UI should stay out of a real fullscreen session.
+    return state == QUNS_RUNNING_D3D_FULL_SCREEN ||
+        state == QUNS_PRESENTATION_MODE;
 }
 
 HWND get_foreground_ui_owner_window()
@@ -95,6 +92,37 @@ HWND get_foreground_ui_owner_window()
     if (root && IsWindow(root) && !IsIconic(root))
         return root;
     return (!IsIconic(hwnd)) ? hwnd : nullptr;
+}
+
+DWORD window_process_id(HWND hwnd)
+{
+    DWORD pid = 0;
+    if (hwnd)
+        GetWindowThreadProcessId(hwnd, &pid);
+    return pid;
+}
+
+HWND trace_context_view_relationship(ITfContextView* view)
+{
+    HWND view_hwnd = nullptr;
+#ifndef NDEBUG
+    const HRESULT get_wnd_hr = view ? view->GetWnd(&view_hwnd) : E_INVALIDARG;
+    const HWND root_hwnd = view_hwnd ? GetAncestor(view_hwnd, GA_ROOT) : nullptr;
+    const HWND foreground_hwnd = GetForegroundWindow();
+    ime_tracef(L"ContextView",
+               L"getwnd_hr=0x%08lx view=0x%p view_pid=%lu root=0x%p root_pid=%lu fg=0x%p fg_pid=%lu",
+               static_cast<unsigned long>(get_wnd_hr),
+               view_hwnd,
+               window_process_id(view_hwnd),
+               root_hwnd,
+               window_process_id(root_hwnd),
+               foreground_hwnd,
+               window_process_id(foreground_hwnd));
+#else
+    if (view)
+        view->GetWnd(&view_hwnd);
+#endif
+    return view_hwnd;
 }
 
 bool try_get_caret_fallback_rect(RECT* rc_out)
@@ -213,6 +241,20 @@ bool is_valid_text_ext_rect(const RECT& rc, BOOL fClipped)
            has_vertical_span &&
            !looks_uninitialized_rect &&
            !looks_origin_fallback_rect;
+}
+
+bool is_window_in_foreground_tree(HWND window)
+{
+    if (!window || !IsWindow(window))
+        return false;
+    HWND foreground = GetForegroundWindow();
+    if (!foreground)
+        return false;
+    HWND foreground_root = GetAncestor(foreground, GA_ROOT);
+    HWND window_root = GetAncestor(window, GA_ROOT);
+    if (foreground_root && window_root && foreground_root == window_root)
+        return true;
+    return IsChild(foreground, window) || IsChild(window, foreground);
 }
 
 RECT resolve_primary_work_area()
@@ -347,17 +389,31 @@ std::wstring trim_ws(const std::wstring& s)
 
 void text_service::ShowCandidates(ITfContext* pContext)
 {
+    ZIME_PERF_SCOPE("tip.ShowCandidates",
+                    static_cast<std::int64_t>(m_compositionText.size()),
+                    m_candidateWindow.get_candidate_count());
     const HWND hwnd_before_show = m_candidateWindow.get_hwnd();
     const bool was_visible = hwnd_before_show && IsWindowVisible(hwnd_before_show);
 
     UpdateCandidateUIElement(pContext);
-    if (ShouldShowOwnCandidateWindow())
+    const bool own_candidate_ui = ShouldShowOwnCandidateWindow();
+    const bool broker_connected = m_brokerClient.IsConnected();
+    const bool broker_candidate_ui = ShouldShowBrokerCandidateWindow();
+    if (broker_candidate_ui && broker_connected)
     {
-        EnsureCandidateWindow();
-        if (m_candidateWindow.get_hwnd())
-            UpdateCandidateWindowPosition(pContext);
+        // The Broker keeps this generation pending until OnLayoutChange has
+        // produced a fresh anchor and the matching result reached this thread.
+        ApplyCandidateWindowVisibility();
     }
-    ApplyCandidateWindowVisibility();
+    else
+    {
+        if (own_candidate_ui)
+        {
+            EnsureCandidateWindow();
+            UpdateCandidateWindowPosition(pContext);
+        }
+        ApplyCandidateWindowVisibility();
+    }
 
     const HWND hwnd_after_show = m_candidateWindow.get_hwnd();
     const bool has_content =
@@ -376,6 +432,7 @@ void text_service::HideCandidates()
 {
     EndCandidateUIElement();
     m_candidateWindow.show(FALSE);
+    SyncBrokerCandidateState();
 }
 
 void text_service::OnHostCandidateUiShowChanged(BOOL bShow)
@@ -389,22 +446,546 @@ bool text_service::ShouldShowOwnCandidateWindow() const
     return m_hostWantsCandidateWindow;
 }
 
+bool text_service::ShouldShowBrokerCandidateWindow() const
+{
+    // Search UI is hosted in a privileged shell window band. A normal
+    // out-of-process topmost Broker HWND remains below that band, while the
+    // in-process TIP window is placed correctly by the shell host.
+    if (prefer_in_process_shell_candidate_window())
+        return false;
+
+    // UIElement-only hosts cannot host our HWND, but the per-user Broker can.
+    // Keep honoring explicit suppression in regular hosts to avoid duplicate UI.
+    return m_hostWantsCandidateWindow || m_uiElementOnlyMode;
+}
+
 bool text_service::ShouldShowStatusWindow() const
+{
+    return true;
+}
+
+bool text_service::ShouldShowLocalStatusWindow() const
 {
     return !m_uiElementOnlyMode;
 }
 
 void text_service::ApplyCandidateWindowVisibility()
 {
+    ZIME_PERF_SCOPE("tip.ApplyCandidateVisibility",
+                    static_cast<std::int64_t>(m_compositionText.size()),
+                    m_candidateWindow.get_candidate_count());
     const bool has_content =
         m_bInComposition &&
         (!m_compositionText.empty() || m_candidateWindow.get_candidate_count() > 0);
     const bool should_show = has_content && ShouldShowOwnCandidateWindow();
-    m_candidateWindow.show(should_show ? TRUE : FALSE);
+    const bool broker_owns_window =
+        m_brokerClient.IsConnected() && ShouldShowBrokerCandidateWindow();
+    if (broker_owns_window)
+    {
+        // Candidate data remains in candidate_form, but its HWND is redundant
+        // once the Broker owns presentation. Keeping a hidden HWND causes GDI
+        // measurement and SetWindowPos work on every result in some VM hosts.
+        m_candidateWindow.destroy();
+    }
+    else
+    {
+        m_candidateWindow.show(should_show ? TRUE : FALSE);
+    }
+    SyncBrokerCandidateState();
+}
+
+void text_service::SyncBrokerCandidateState(const RECT* anchor_override)
+{
+    const int candidate_count = m_candidateWindow.get_candidate_count();
+
+    HWND owner = m_brokerViewHwnd;
+    if (owner && IsWindow(owner))
+    {
+        HWND root = GetAncestor(owner, GA_ROOT);
+        if (root && IsWindow(root) &&
+            window_process_id(root) == GetCurrentProcessId())
+            owner = root;
+        else if (root && window_process_id(root) != GetCurrentProcessId())
+            owner = nullptr;
+    }
+    const bool has_content = m_bInComposition &&
+        (!m_compositionText.empty() || candidate_count > 0);
+    const bool custom_ui_allowed = ShouldShowBrokerCandidateWindow();
+    const bool broker_owns_window =
+        m_brokerClient.IsConnected() && custom_ui_allowed;
+    const bool candidate_snapshot_ready =
+        !m_compositionText.empty() &&
+        m_brokerCandidateCode == m_compositionText;
+    const bool presentation_pending = broker_owns_window && has_content &&
+        (!m_brokerCandidateLayoutReady || !candidate_snapshot_ready);
+    const RECT* anchor = anchor_override;
+    RECT cached_anchor = {};
+    if (!anchor && TryGetCachedCandidateAnchorRect(&cached_anchor))
+        anchor = &cached_anchor;
+    m_brokerClient.SendCandidateState(
+        owner,
+        anchor,
+        has_content && custom_ui_allowed && !presentation_pending,
+        custom_ui_allowed,
+        m_compositionText,
+        static_cast<std::uint32_t>(max(0, GetCandidateSelectionAbsolute())),
+        static_cast<std::uint32_t>(max(1, m_candidateWindow.get_page_size())),
+        static_cast<std::uint32_t>(max(0, m_candidateWindow.get_current_page())),
+        static_cast<std::uint32_t>(min(250, m_uiFontPercent + CANDIDATE_FONT_BOOST_PERCENT)),
+        presentation_pending);
+}
+
+void text_service::OnBrokerConnectionChanged(bool connected)
+{
+    ime_tracef(L"BrokerConnectionState", L"connected=%d", connected ? 1 : 0);
+    // Config revisions belong to one Broker process and may restart at one
+    // after a crash, upgrade, or explicit shutdown.
+    m_hasBrokerConfig = false;
+    m_brokerConfigRevision = 0;
+    if (connected && ShouldShowBrokerCandidateWindow())
+        m_candidateWindow.destroy();
+    ApplyCandidateWindowVisibility();
+    if (connected)
+    {
+        m_statusWindow.show(false);
+        SyncBrokerStatusState();
+        if (m_bInComposition && !m_compositionText.empty())
+            RequestBrokerCandidates();
+    }
+    else
+    {
+        if (m_pendingCreateWordRequest != 0)
+        {
+            m_pendingCreateWordRequest = 0;
+            if (m_hCreateWordWnd && IsWindow(m_hCreateWordWnd))
+                EnableWindow(GetDlgItem(m_hCreateWordWnd, IDC_CREATE_OK), TRUE);
+        }
+        m_pendingCandidateStorageRequests.clear();
+        if (m_statusWindowDesiredVisible && ShouldShowStatusWindow())
+            ShowStatusWindow();
+    }
+}
+
+void text_service::OnBrokerStorageResult(
+    zime::broker_protocol::storage_operation operation,
+    std::uint64_t request_id,
+    bool success,
+    const std::wstring& error)
+{
+    using zime::broker_protocol::storage_operation;
+    if (operation == storage_operation::add_custom_word &&
+        request_id == m_pendingCreateWordRequest)
+    {
+        m_pendingCreateWordRequest = 0;
+        if (!m_hCreateWordWnd || !IsWindow(m_hCreateWordWnd))
+            return;
+        EnableWindow(GetDlgItem(m_hCreateWordWnd, IDC_CREATE_OK), TRUE);
+        if (!success)
+        {
+            const std::wstring detail = error.empty() ? L"后台写入失败" : error;
+            MessageBoxW(m_hCreateWordWnd,
+                        (L"写入词库失败:\n" + detail).c_str(),
+                        L"错误",
+                        MB_OK | MB_ICONERROR);
+            return;
+        }
+        MessageBoxW(m_hCreateWordWnd,
+                    L"造词成功，已写入用户词库并即时生效。",
+                    L"提示",
+                    MB_OK | MB_ICONINFORMATION);
+        DestroyWindow(m_hCreateWordWnd);
+        return;
+    }
+
+    const auto pending = m_pendingCandidateStorageRequests.find(request_id);
+    if (pending == m_pendingCandidateStorageRequests.end())
+        return;
+    const bool operation_matches = pending->second == operation;
+    m_pendingCandidateStorageRequests.erase(pending);
+    if (!success || !operation_matches)
+    {
+        const std::wstring detail = error.empty() ? L"后台写入失败" : error;
+        MessageBoxW(m_brokerViewHwnd,
+                    (L"更新用户词库失败:\n" + detail).c_str(),
+                    L"错误",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+    RefreshCandidatesAfterStorageMutation();
+}
+
+void text_service::OnBrokerConfigState(
+    const zime::broker_protocol::config_state& state)
+{
+    using namespace zime::broker_protocol;
+    const bool refresh_candidates =
+        m_commitFirstCandidateOnFifthCode !=
+            ((state.flags & setting_commit_first_on_fifth) != 0) ||
+        m_showUncommonCandidates !=
+            ((state.flags & setting_show_uncommon) != 0) ||
+        static_cast<std::uint32_t>(m_candidateSortMode) !=
+            (std::min)(state.candidate_sort_mode, 2u) ||
+        m_uiFontPercent != static_cast<int>(std::clamp<std::uint32_t>(
+            state.ui_font_percent, 80, 250));
+
+    const bool punctuation_preference_changed = m_hasBrokerConfig &&
+        m_useEnglishPunctuationInChineseMode !=
+            ((state.flags & setting_use_english_punctuation) != 0);
+    m_autoCommitFourCodeUnique =
+        (state.flags & setting_auto_commit_four_unique) != 0;
+    m_commitFirstCandidateOnFifthCode =
+        (state.flags & setting_commit_first_on_fifth) != 0;
+    m_showUncommonCandidates =
+        (state.flags & setting_show_uncommon) != 0;
+    m_replaceDotAfterDigit =
+        (state.flags & setting_replace_dot_after_digit) != 0;
+    m_useEnglishPunctuationInChineseMode =
+        (state.flags & setting_use_english_punctuation) != 0;
+    m_disableChineseDash =
+        (state.flags & setting_disable_chinese_dash) != 0;
+    m_candidateSortMode = candidate_sort_mode_from_int(
+        static_cast<int>((std::min)(state.candidate_sort_mode, 2u)));
+    m_uiFontPercent = static_cast<int>(std::clamp<std::uint32_t>(
+        state.ui_font_percent, 80, 250));
+    m_statusWindowPositionCustomized =
+        (state.flags & setting_status_position_customized) != 0;
+    m_statusWindowPosX = state.status_position_x;
+    m_statusWindowPosY = state.status_position_y;
+    if (!m_hasBrokerConfig || punctuation_preference_changed)
+        SyncPunctuationModeWithLanguageMode();
+    m_hasBrokerConfig = true;
+    m_brokerConfigRevision = state.revision;
+    UpdateStatusWindow(false);
+    if (is_window_in_foreground_tree(m_brokerViewHwnd))
+        SyncBrokerStatusState();
+    if (m_hCreateWordWnd && IsWindow(m_hCreateWordWnd))
+        PostMessageW(m_hCreateWordWnd, WM_CREATE_WORD_APPLY_LAYOUT, 0, 0);
+    if (refresh_candidates)
+        RefreshCandidatesAfterStorageMutation();
+
+    ime_tracef(L"BrokerConfigState",
+               L"revision=%llu flags=0x%08lx font=%lu sort=%lu",
+               static_cast<unsigned long long>(state.revision),
+               static_cast<unsigned long>(state.flags),
+               static_cast<unsigned long>(state.ui_font_percent),
+               static_cast<unsigned long>(state.candidate_sort_mode));
+}
+
+void text_service::RequestBrokerCandidates(bool apply_auto_commit)
+{
+    m_brokerCommitFirstOnNextCode = false;
+    m_firstCandidateIsPinyin = false;
+    m_brokerCandidateCode.clear();
+    if (m_compositionText.empty())
+        return;
+    if (m_brokerClient.IsConnected())
+    {
+        m_brokerClient.RequestCandidates(
+            m_compositionText, apply_auto_commit);
+        return;
+    }
+
+    // 断线期间保留组合串，Broker 重连后会立即重新查询。
+}
+
+bool text_service::ResolveBrokerCandidatesSynchronously(bool apply_auto_commit)
+{
+    ZIME_PERF_SCOPE("tip.ResolveBrokerSync",
+                    static_cast<std::int64_t>(m_compositionText.size()),
+                    apply_auto_commit ? 1 : 0);
+    if (m_compositionText.empty() || !m_brokerClient.IsConnected())
+        return false;
+
+    const std::wstring code = m_compositionText;
+    std::vector<std::wstring> candidates;
+    std::vector<std::wstring> view_texts;
+    std::vector<bool> pinyin_flags;
+    std::uint32_t result_flags = 0;
+    std::uint64_t config_revision = 0;
+    constexpr DWORD kCriticalCandidateTimeoutMs = 20;
+    if (!m_brokerClient.QueryCandidatesSync(code,
+                                            &candidates,
+                                            &view_texts,
+                                            &pinyin_flags,
+                                            kCriticalCandidateTimeoutMs,
+                                            apply_auto_commit,
+                                            &result_flags,
+                                            &config_revision))
+    {
+        return false;
+    }
+
+    OnBrokerCandidateResult(0,
+                            code,
+                            candidates,
+                            view_texts,
+                            pinyin_flags,
+                            result_flags,
+                            config_revision);
+    return true;
+}
+
+void text_service::OnBrokerCandidateResult(
+    std::uint64_t generation,
+    const std::wstring& code,
+    const std::vector<std::wstring>& candidates,
+    const std::vector<std::wstring>& view_texts,
+    const std::vector<bool>& pinyin_flags,
+    std::uint32_t result_flags,
+    std::uint64_t config_revision)
+{
+    ZIME_PERF_SCOPE("tip.OnBrokerCandidateResult",
+                    static_cast<std::int64_t>(code.size()),
+                    static_cast<std::int64_t>(candidates.size()));
+    using namespace zime::broker_protocol;
+    if (!m_bInComposition || code != m_compositionText)
+        return;
+
+    std::wstring pending_characters;
+    pending_characters.swap(m_pendingCodeCharacters);
+    pending_candidate_action deferred_action = pending_candidate_action::none;
+    int deferred_number = 0;
+    if (m_pendingCandidateActionCode == code)
+    {
+        deferred_action = m_pendingCandidateAction;
+        deferred_number = m_pendingCandidateNumber;
+    }
+    m_pendingCandidateAction = pending_candidate_action::none;
+    m_pendingCandidateActionCode.clear();
+    m_pendingCandidateNumber = 0;
+
+    if (config_revision != 0 &&
+        m_brokerConfigRevision != 0 &&
+        config_revision < m_brokerConfigRevision)
+    {
+        // A lower revision identifies a replacement Broker. Accept this
+        // result instead of creating an unbounded stale-result retry loop.
+        ime_tracef(L"BrokerConfigRevisionReset",
+                   L"previous=%llu current=%llu generation=%llu",
+                   static_cast<unsigned long long>(m_brokerConfigRevision),
+                   static_cast<unsigned long long>(config_revision),
+                   static_cast<unsigned long long>(generation));
+        m_hasBrokerConfig = false;
+        m_brokerConfigRevision = config_revision;
+    }
+    m_brokerCandidateCode = code;
+    m_firstCandidateIsPinyin = !pinyin_flags.empty() && pinyin_flags[0];
+    m_brokerCommitFirstOnNextCode =
+        (result_flags & candidate_result_commit_first_on_next_code) != 0;
+    {
+        ZIME_PERF_SCOPE("tip.StoreCandidateSnapshot",
+                        static_cast<std::int64_t>(code.size()),
+                        static_cast<std::int64_t>(candidates.size()));
+        m_candidateWindow.set_composition_text(code);
+        m_candidateWindow.set_candidates(candidates, view_texts);
+    }
+
+    ITfDocumentMgr* document_manager = nullptr;
+    ITfContext* context = nullptr;
+    if (m_pThreadMgr &&
+        SUCCEEDED(m_pThreadMgr->GetFocus(&document_manager)) &&
+        document_manager)
+    {
+        document_manager->GetTop(&context);
+        document_manager->Release();
+    }
+
+    if ((result_flags & candidate_result_auto_commit_first) != 0 &&
+        !candidates.empty() && !candidates[0].empty())
+    {
+        const std::wstring display = view_texts.empty()
+            ? candidates[0]
+            : view_texts[0];
+        RecordCandidateSelection(code, candidates[0], display);
+        InsertText(context, candidates[0]);
+        ClearComposition();
+        HideCandidates();
+    }
+    else if (deferred_action == pending_candidate_action::space)
+    {
+        if (!candidates.empty())
+        {
+            HandleNumber(context, 1);
+        }
+        else
+        {
+            InsertText(context, code);
+            ClearComposition();
+            HideCandidates();
+        }
+    }
+    else if (deferred_action == pending_candidate_action::number)
+    {
+        if (deferred_number > 0 &&
+            deferred_number <= m_candidateWindow.get_candidate_count())
+        {
+            HandleNumber(context, deferred_number);
+        }
+        else
+        {
+            ShowCandidates(context);
+        }
+    }
+    else
+    {
+        ShowCandidates(context);
+    }
+    if (context)
+        context->Release();
+
+    if (!pending_characters.empty())
+    {
+        ITfDocumentMgr* pending_document_manager = nullptr;
+        ITfContext* pending_context = nullptr;
+        if (m_pThreadMgr &&
+            SUCCEEDED(m_pThreadMgr->GetFocus(&pending_document_manager)) &&
+            pending_document_manager)
+        {
+            pending_document_manager->GetTop(&pending_context);
+            pending_document_manager->Release();
+        }
+        for (const wchar_t character : pending_characters)
+            HandleCharacter(pending_context, character);
+        if (pending_context)
+            pending_context->Release();
+    }
+    ime_tracef(L"BrokerCandidateResult",
+               L"generation=%llu config_revision=%llu code_chars=%lu candidates=%lu flags=0x%lx",
+               static_cast<unsigned long long>(generation),
+               static_cast<unsigned long long>(config_revision),
+               static_cast<unsigned long>(code.size()),
+               static_cast<unsigned long>(candidates.size()),
+               static_cast<unsigned long>(result_flags));
+}
+
+void text_service::RefreshCandidatesAfterStorageMutation()
+{
+    if (!m_bInComposition || m_compositionText.empty())
+        return;
+
+    RequestBrokerCandidates();
+}
+
+void text_service::OnBrokerUiAction(
+    zime::broker_protocol::ui_action_type action,
+    std::uint32_t value,
+    POINT screen_point)
+{
+    using zime::broker_protocol::ui_action_type;
+    switch (action)
+    {
+    case ui_action_type::candidate_select:
+        if (m_bInComposition &&
+            m_brokerCandidateCode != m_compositionText)
+        {
+            if (!ResolveBrokerCandidatesSynchronously(false))
+            {
+                m_pendingCandidateAction = pending_candidate_action::number;
+                m_pendingCandidateActionCode = m_compositionText;
+                m_pendingCandidateNumber = static_cast<int>(value) + 1;
+                return;
+            }
+            if (!m_bInComposition)
+                return;
+        }
+        OnCandidateClicked(static_cast<int>(value));
+        return;
+    case ui_action_type::candidate_delete:
+        OnCandidateContextCommand(static_cast<int>(value), true);
+        return;
+    case ui_action_type::candidate_mark_uncommon:
+        OnCandidateContextCommand(static_cast<int>(value), false);
+        return;
+    case ui_action_type::candidate_page:
+    {
+        const int target_page = static_cast<int>(value);
+        while (m_candidateWindow.get_current_page() < target_page)
+            m_candidateWindow.page_down();
+        while (m_candidateWindow.get_current_page() > target_page)
+            m_candidateWindow.page_up();
+        m_candidateWindow.set_selection(0);
+
+        ITfDocumentMgr* document_manager = nullptr;
+        ITfContext* context = nullptr;
+        if (m_pThreadMgr &&
+            SUCCEEDED(m_pThreadMgr->GetFocus(&document_manager)) &&
+            document_manager)
+        {
+            document_manager->GetTop(&context);
+            document_manager->Release();
+        }
+        UpdateCandidateUIElement(context);
+        if (context)
+            context->Release();
+        SyncBrokerCandidateState();
+        return;
+    }
+    case ui_action_type::status_change:
+    {
+        const int status_type = static_cast<int>(value);
+        const int state_value = screen_point.x;
+        switch (status_type)
+        {
+        case status_window::STATUS_FULL_WIDTH:
+            m_statusWindow.set_full_width(state_value != 0);
+            break;
+        case status_window::STATUS_CHINESE_MODE:
+            m_statusWindow.set_chinese_mode(state_value != 0);
+            break;
+        case status_window::STATUS_PUNCTUATION:
+            m_statusWindow.set_chinese_punctuation(state_value != 0);
+            break;
+        case status_window::STATUS_AUTO_COMMIT_FOUR_UNIQUE:
+            m_statusWindow.set_auto_commit_four_code_unique(state_value != 0);
+            break;
+        case status_window::STATUS_COMMIT_FIRST_CANDIDATE_ON_FIFTH_CODE:
+            m_statusWindow.set_commit_first_candidate_on_fifth_code(state_value != 0);
+            break;
+        case status_window::STATUS_SHOW_UNCOMMON_CANDIDATES:
+            m_statusWindow.set_show_uncommon_candidates(state_value != 0);
+            break;
+        case status_window::STATUS_REPLACE_DOT_AFTER_DIGIT:
+            m_statusWindow.set_replace_dot_after_digit(state_value != 0);
+            break;
+        case status_window::STATUS_USE_ENGLISH_PUNCTUATION_IN_CHINESE_MODE:
+            m_statusWindow.set_use_english_punctuation_in_chinese_mode(
+                state_value != 0);
+            break;
+        case status_window::STATUS_DISABLE_CHINESE_DASH:
+            m_statusWindow.set_disable_chinese_dash(state_value != 0);
+            break;
+        case status_window::STATUS_UI_FONT_CHANGED:
+            m_statusWindow.set_ui_font_percent(state_value);
+            break;
+        case status_window::STATUS_CANDIDATE_SORT_MODE_CHANGED:
+            m_statusWindow.set_candidate_sort_mode(
+                static_cast<status_window::CandidateSortMode>(
+                    min(2, max(0, state_value))));
+            break;
+        default:
+            break;
+        }
+        OnStatusChanged(status_type);
+        SyncBrokerStatusState();
+        return;
+    }
+    case ui_action_type::status_position:
+        OnStatusWindowMoved(screen_point.x, screen_point.y);
+        SyncBrokerStatusState();
+        return;
+    case ui_action_type::status_menu_popup:
+        m_inStatusMenuPopup = value != 0;
+        return;
+    default:
+        return;
+    }
 }
 
 void text_service::UpdateCandidateUIElement(ITfContext *pContext)
 {
+    ZIME_PERF_SCOPE("tip.UpdateCandidateUIElement",
+                    static_cast<std::int64_t>(m_compositionText.size()),
+                    m_candidateWindow.get_candidate_count());
     if (!m_pThreadMgr)
         return;
 
@@ -513,26 +1094,43 @@ void text_service::UpdateCandidateUIElement(ITfContext *pContext)
         }
         BOOL bShow = TRUE;
         const HRESULT hrBegin = pUIMgr->BeginUIElement(m_candidateUIElement, &bShow, &m_candidateUIElementId);
+        ime_tracef(L"BeginUIElement",
+                   L"hr=0x%08lx show=%d id=%lu count=%d uielement_only=%d",
+                   static_cast<unsigned long>(hrBegin),
+                   bShow ? 1 : 0,
+                   static_cast<unsigned long>(m_candidateUIElementId),
+                   candidate_count,
+                   m_uiElementOnlyMode ? 1 : 0);
         if (FAILED(hrBegin))
         {
+            if (m_uiElementOnlyMode)
+                m_hostWantsCandidateWindow = false;
             pUIMgr->Release();
             return;
         }
         else
         {
             m_hostWantsCandidateWindow = (bShow != FALSE);
+            m_candidateUIElement->set_initial_show_state(bShow);
         }
     }
     else if (candidate_count <= 0)
     {
-        const HRESULT hrUpdateEmpty = pUIMgr->UpdateUIElement(m_candidateUIElementId);
-        (void)hrUpdateEmpty;
+        const HRESULT hrEnd = pUIMgr->EndUIElement(m_candidateUIElementId);
+        ime_tracef(L"EndUIElement", L"empty hr=0x%08lx id=%lu",
+                   static_cast<unsigned long>(hrEnd),
+                   static_cast<unsigned long>(m_candidateUIElementId));
+        m_candidateUIElementId = TF_INVALID_UIELEMENTID;
         pUIMgr->Release();
         return;
     }
 
     const HRESULT hrUpdate = pUIMgr->UpdateUIElement(m_candidateUIElementId);
-    (void)hrUpdate;
+    ime_tracef(L"UpdateUIElement", L"hr=0x%08lx id=%lu count=%d show_own=%d",
+               static_cast<unsigned long>(hrUpdate),
+               static_cast<unsigned long>(m_candidateUIElementId),
+               candidate_count,
+               m_hostWantsCandidateWindow ? 1 : 0);
     pUIMgr->Release();
 }
 
@@ -545,7 +1143,9 @@ void text_service::EndCandidateUIElement()
     if (SUCCEEDED(m_pThreadMgr->QueryInterface(IID_ITfUIElementMgr, reinterpret_cast<void **>(&pUIMgr))))
     {
         const HRESULT hrEnd = pUIMgr->EndUIElement(m_candidateUIElementId);
-        (void)hrEnd;
+        ime_tracef(L"EndUIElement", L"hr=0x%08lx id=%lu",
+                   static_cast<unsigned long>(hrEnd),
+                   static_cast<unsigned long>(m_candidateUIElementId));
         pUIMgr->Release();
     }
     m_candidateUIElementId = TF_INVALID_UIELEMENTID;
@@ -563,7 +1163,13 @@ void text_service::EnsureCandidateWindow()
         m_candidateWindow.destroy();
     }
 
-    m_candidateWindow.create(owner);
+    const BOOL created = m_candidateWindow.create(owner);
+    ime_tracef(L"CandidateWindowCreate",
+               L"created=%d hwnd=0x%p owner=0x%p owner_pid=%lu",
+               created ? 1 : 0,
+               m_candidateWindow.get_hwnd(),
+               owner,
+               window_process_id(owner));
     m_candidateWindow.set_ui_font_percent(min(250, m_uiFontPercent + CANDIDATE_FONT_BOOST_PERCENT));
     m_candidateWindow.set_click_callback(
         [this](int candidate_index) {
@@ -575,9 +1181,14 @@ void text_service::EnsureCandidateWindow()
         });
 }
 
-void text_service::UpdateCandidateWindowPosition(ITfContext* pContext)
+void text_service::UpdateCandidateWindowPosition(ITfContext* pContext,
+                                                 bool asynchronous,
+                                                 bool confirms_layout)
 {
-    if (!pContext)
+    ZIME_PERF_SCOPE("tip.UpdateCandidatePosition",
+                    asynchronous ? 1 : 0,
+                    m_candidatePositionEditPending ? 1 : 0);
+    if (!pContext || m_candidatePositionEditPending)
         return;
 
     // 为了遵循 TSF 规范，在 EditSession 中通过 ITfContextView::GetTextExt
@@ -585,17 +1196,38 @@ void text_service::UpdateCandidateWindowPosition(ITfContext* pContext)
     class CandidatePosEditSession : public ITfEditSession
     {
     public:
-        CandidatePosEditSession(text_service* service, ITfContext* context)
-            : _ref(1), _service(service), _context(context)
+        CandidatePosEditSession(text_service* service,
+                                ITfContext* context,
+                                bool confirms_layout)
+            : _ref(1),
+              _service(service),
+              _context(context),
+              _confirms_layout(confirms_layout),
+              _composition(service ? service->m_compositionText : L""),
+              _executed(false)
         {
             if (_context)
                 _context->AddRef();
+            if (_service)
+                _service->AddRef();
         }
 
         virtual ~CandidatePosEditSession()
         {
+            const bool retry_current_layout =
+                _executed && _confirms_layout && _service && _context &&
+                !_service->m_compositionText.empty() &&
+                _service->m_compositionText != _composition;
+            if (_service)
+                _service->m_candidatePositionEditPending = false;
+            if (retry_current_layout)
+                _service->UpdateCandidateWindowPosition(_context, true, true);
             if (_context)
                 _context->Release();
+            if (_service)
+            {
+                _service->Release();
+            }
         }
 
         STDMETHODIMP QueryInterface(REFIID riid, void** ppvObj) override
@@ -634,11 +1266,21 @@ void text_service::UpdateCandidateWindowPosition(ITfContext* pContext)
 
         STDMETHODIMP DoEditSession(TfEditCookie ec) override
         {
+            ZIME_PERF_SCOPE("tip.CandidatePositionEdit", 0, 0);
             if (!_service || !_context)
                 return E_FAIL;
+            _executed = true;
 
             ITfContextView* pView = nullptr;
             bool positioned = false;
+            const auto confirm_current_layout = [&]()
+            {
+                if (_confirms_layout &&
+                    _service->m_compositionText == _composition)
+                {
+                    _service->m_brokerCandidateLayoutReady = true;
+                }
+            };
 
             const auto fallback_position = [&]() -> bool
             {
@@ -646,29 +1288,31 @@ void text_service::UpdateCandidateWindowPosition(ITfContext* pContext)
                 if (try_get_caret_fallback_rect(&fallback))
                 {
                     _service->RememberCandidateAnchorRect(fallback);
+                    confirm_current_layout();
                     _service->UpdateCandidateWindowPositionFromRect(fallback);
                     return true;
                 }
                 if (_service->TryGetCachedCandidateAnchorRect(&fallback))
                 {
+                    confirm_current_layout();
                     _service->UpdateCandidateWindowPositionFromRect(fallback);
                     return true;
                 }
                 if (try_get_focus_window_fallback_rect(&fallback))
                 {
-                    _service->RememberCandidateAnchorRect(fallback);
+                    confirm_current_layout();
                     _service->UpdateCandidateWindowPositionFromRect(fallback);
                     return true;
                 }
                 if (try_get_view_fallback_rect(pView, &fallback))
                 {
-                    _service->RememberCandidateAnchorRect(fallback);
+                    confirm_current_layout();
                     _service->UpdateCandidateWindowPositionFromRect(fallback);
                     return true;
                 }
                 if (try_get_owner_window_fallback_rect(&fallback))
                 {
-                    _service->RememberCandidateAnchorRect(fallback);
+                    confirm_current_layout();
                     _service->UpdateCandidateWindowPositionFromRect(fallback);
                     return true;
                 }
@@ -683,9 +1327,20 @@ void text_service::UpdateCandidateWindowPosition(ITfContext* pContext)
                 RECT rc = { 0 };
                 BOOL fClipped = FALSE;
                 const HRESULT hrExt = pView->GetTextExt(ec, pRange, &rc, &fClipped);
-                if (SUCCEEDED(hrExt) && is_valid_text_ext_rect(rc, fClipped))
+                const bool valid = SUCCEEDED(hrExt) && is_valid_text_ext_rect(rc, fClipped);
+                ime_tracef(L"GetTextExt",
+                           L"hr=0x%08lx clipped=%d valid=%d rect=(%ld,%ld,%ld,%ld)",
+                           static_cast<unsigned long>(hrExt),
+                           fClipped ? 1 : 0,
+                           valid ? 1 : 0,
+                           rc.left,
+                           rc.top,
+                           rc.right,
+                           rc.bottom);
+                if (valid)
                 {
                     _service->RememberCandidateAnchorRect(rc);
+                    confirm_current_layout();
                     _service->UpdateCandidateWindowPositionFromRect(rc);
                     return true;
                 }
@@ -698,6 +1353,8 @@ void text_service::UpdateCandidateWindowPosition(ITfContext* pContext)
                 fallback_position();
                 return S_OK; // 无法获取视图时使用兜底定位，避免影响输入
             }
+            const HWND view_hwnd = trace_context_view_relationship(pView);
+            _service->SendBrokerContextSnapshot(view_hwnd);
 
             if (_service->m_pComposition)
             {
@@ -745,7 +1402,14 @@ void text_service::UpdateCandidateWindowPosition(ITfContext* pContext)
             pView->Release();
             if (!positioned)
             {
-                fallback_position();
+                positioned = fallback_position();
+            }
+            if (!positioned && _confirms_layout &&
+                _service->m_compositionText == _composition)
+            {
+                // The Broker can still use its GUI-thread caret fallback.
+                _service->m_brokerCandidateLayoutReady = true;
+                _service->SyncBrokerCandidateState();
             }
             return S_OK;
         }
@@ -754,16 +1418,33 @@ void text_service::UpdateCandidateWindowPosition(ITfContext* pContext)
         LONG _ref;
         text_service* _service;
         ITfContext* _context;
+        bool _confirms_layout;
+        std::wstring _composition;
+        bool _executed;
     };
 
-    CandidatePosEditSession* pEditSession = new CandidatePosEditSession(this, pContext);
+    m_candidatePositionEditPending = true;
+    CandidatePosEditSession* pEditSession = new CandidatePosEditSession(
+        this, pContext, confirms_layout);
     if (pEditSession)
     {
         HRESULT hr = S_OK;
-        const HRESULT hrRequest = pContext->RequestEditSession(m_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READ, &hr);
-        if (FAILED(hrRequest) || FAILED(hr))
-            pContext->RequestEditSession(m_tfClientId, pEditSession, TF_ES_ASYNC | TF_ES_READ, &hr);
+        const DWORD flags = (asynchronous ? TF_ES_ASYNC : TF_ES_SYNC) | TF_ES_READ;
+        HRESULT hrRequest = pContext->RequestEditSession(
+            m_tfClientId, pEditSession, flags, &hr);
+        if (!asynchronous && (FAILED(hrRequest) || FAILED(hr)))
+        {
+            m_candidatePositionEditPending = true;
+            hrRequest = pContext->RequestEditSession(
+                m_tfClientId, pEditSession, TF_ES_ASYNC | TF_ES_READ, &hr);
+        }
+        ZIME_PERF_RECORD("tip.UpdateCandidatePosition.result",
+                         hrRequest, hr, asynchronous ? 1 : 0);
         pEditSession->Release();
+    }
+    else
+    {
+        m_candidatePositionEditPending = false;
     }
 }
 
@@ -781,11 +1462,16 @@ void text_service::ClearCandidateAnchorRect()
     m_hasLastCandidateAnchorRect = false;
     m_lastCandidateAnchorTick = 0;
     m_lastCandidateAnchorOwner = nullptr;
+    m_brokerCandidateLayoutReady = false;
 }
 
 bool text_service::TryGetCachedCandidateAnchorRect(RECT* rc_out) const
 {
     if (!rc_out || !m_hasLastCandidateAnchorRect)
+        return false;
+
+    constexpr DWORD kAnchorCacheLifetimeMs = 5000;
+    if (GetTickCount() - m_lastCandidateAnchorTick > kAnchorCacheLifetimeMs)
         return false;
 
     const HWND current_owner = get_foreground_ui_owner_window();
@@ -902,6 +1588,7 @@ void text_service::FinalizeExactCompositionStringFromUi()
 
 void text_service::UpdateCandidateWindowPositionFromRect(const RECT& rc)
 {
+    SyncBrokerCandidateState(&rc);
     HWND hwndCand = m_candidateWindow.get_hwnd();
     if (!hwndCand)
         return;
@@ -973,17 +1660,23 @@ void text_service::UpdateCandidateWindowPositionFromRect(const RECT& rc)
 
 std::filesystem::path text_service::GetConfigPath() const
 {
-    std::filesystem::path dll_dir = tool::get_current_dll_path();
-    return dll_dir / CONFIG_FILE;
+    return tool::get_user_data_path() / CONFIG_FILE;
 }
 
 void text_service::LoadRuntimeConfig()
 {
-    const std::filesystem::path cfg = GetConfigPath();
+    std::filesystem::path cfg = GetConfigPath();
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(cfg, error))
+    {
+        const std::filesystem::path legacy =
+            tool::get_current_dll_path() / CONFIG_FILE;
+        error.clear();
+        if (std::filesystem::is_regular_file(legacy, error))
+            cfg = legacy;
+    }
     const wchar_t* path = cfg.c_str();
 
-    m_bFullWidth = GetPrivateProfileIntW(L"state", L"full_width", m_bFullWidth ? 1 : 0, path) != 0;
-    m_bChinesePunctuation = GetPrivateProfileIntW(L"state", L"chinese_punctuation", m_bChinesePunctuation ? 1 : 0, path) != 0;
     m_autoCommitFourCodeUnique = GetPrivateProfileIntW(L"state", L"auto_commit_four_code_unique", m_autoCommitFourCodeUnique ? 1 : 0, path) != 0;
     m_commitFirstCandidateOnFifthCode = GetPrivateProfileIntW(L"state", L"commit_first_candidate_on_fifth_code", m_commitFirstCandidateOnFifthCode ? 1 : 0, path) != 0;
     m_showUncommonCandidates = GetPrivateProfileIntW(L"state", L"show_uncommon_candidates", m_showUncommonCandidates ? 1 : 0, path) != 0;
@@ -1015,8 +1708,12 @@ void text_service::LoadRuntimeConfig()
     m_statusWindowPosY = GetPrivateProfileIntW(L"ui", L"status_pos_y", 0, path);
 }
 
-void text_service::SaveRuntimeConfig() const
+void text_service::SaveRuntimeConfig()
 {
+    using namespace zime::broker_protocol;
+    if (m_brokerClient.HasStorageWriter())
+        return;
+
     const std::filesystem::path cfg = GetConfigPath();
     std::error_code ec;
     if (!cfg.parent_path().empty())
@@ -1025,8 +1722,6 @@ void text_service::SaveRuntimeConfig() const
     }
 
     const wchar_t* path = cfg.c_str();
-    WritePrivateProfileStringW(L"state", L"full_width", m_bFullWidth ? L"1" : L"0", path);
-    WritePrivateProfileStringW(L"state", L"chinese_punctuation", m_bChinesePunctuation ? L"1" : L"0", path);
     WritePrivateProfileStringW(L"state", L"auto_commit_four_code_unique", m_autoCommitFourCodeUnique ? L"1" : L"0", path);
     WritePrivateProfileStringW(L"state", L"commit_first_candidate_on_fifth_code", m_commitFirstCandidateOnFifthCode ? L"1" : L"0", path);
     WritePrivateProfileStringW(L"state", L"show_uncommon_candidates", m_showUncommonCandidates ? L"1" : L"0", path);
@@ -1056,7 +1751,7 @@ void text_service::SaveRuntimeConfig() const
     WritePrivateProfileStringW(L"ui", L"status_pos_y", posy, path);
 }
 
-void text_service::UpdateStatusWindow()
+void text_service::UpdateStatusWindow(bool sync_broker)
 {
     const int candidate_font_percent = min(250, m_uiFontPercent + CANDIDATE_FONT_BOOST_PERCENT);
 
@@ -1073,28 +1768,88 @@ void text_service::UpdateStatusWindow()
     m_statusWindow.set_candidate_sort_mode(to_status_sort_mode(m_candidateSortMode));
     m_statusWindow.set_ui_font_percent(m_uiFontPercent);
     m_candidateWindow.set_ui_font_percent(candidate_font_percent);
-    m_dictionary.set_show_uncommon_candidates(m_showUncommonCandidates);
-    m_dictionary.set_candidate_sort_mode(m_candidateSortMode);
+    if (sync_broker)
+        SyncBrokerStatusState();
+}
+
+void text_service::SyncBrokerStatusState()
+{
+    using namespace zime::broker_protocol;
+    std::uint32_t flags = 0;
+    if (ShouldShowStatusWindow())
+        flags |= status_custom_ui_allowed;
+    if (m_bFullWidth)
+        flags |= status_full_width;
+    if (m_bChineseMode)
+        flags |= status_chinese_mode;
+    if (m_bChinesePunctuation)
+        flags |= status_chinese_punctuation;
+
+    HWND owner = m_brokerViewHwnd;
+    if (owner && IsWindow(owner))
+    {
+        HWND root = GetAncestor(owner, GA_ROOT);
+        if (root && IsWindow(root) &&
+            window_process_id(root) == GetCurrentProcessId())
+            owner = root;
+        else if (root && window_process_id(root) != GetCurrentProcessId())
+            owner = nullptr;
+    }
+    m_brokerClient.SendStatusState(
+        owner,
+        m_statusWindowDesiredVisible && ShouldShowStatusWindow(),
+        flags,
+        0,
+        0,
+        100,
+        0);
 }
 
 void text_service::ShowStatusWindow()
 {
+    RefreshBrokerContextForCurrentFocus();
     if (!ShouldShowStatusWindow())
     {
+        m_statusWindowDesiredVisible = false;
         if (m_statusWindow.get_hwnd())
             m_statusWindow.show(false);
+        SyncBrokerStatusState();
         return;
     }
 
     // 在全屏前台窗口（典型游戏）下，不主动显示状态窗，避免打断全屏。
     if (is_likely_fullscreen_foreground_window())
     {
+        ime_tracef(L"StatusWindow", L"suppressed reason=fullscreen");
+        m_statusWindowDesiredVisible = false;
         if (m_statusWindow.get_hwnd())
             m_statusWindow.show(false);
+        SyncBrokerStatusState();
+        return;
+    }
+
+    m_statusWindowDesiredVisible = true;
+    if (m_brokerClient.IsConnected())
+    {
+        ime_tracef(L"StatusWindow", L"route=broker visible=1");
+        m_statusWindow.show(false);
+        SyncBrokerStatusState();
+        return;
+    }
+
+    if (!ShouldShowLocalStatusWindow())
+    {
+        ime_tracef(L"StatusWindow", L"route=none uielement_only=1");
+        m_statusWindow.show(false);
+        SyncBrokerStatusState();
         return;
     }
 
     const HWND owner = get_foreground_ui_owner_window();
+    ime_tracef(L"StatusWindow",
+               L"route=local visible=1 owner=0x%p owner_pid=%lu",
+               owner,
+               window_process_id(owner));
 
     // 创建状态窗口（如果还没创建），或在 owner 变化时重建。
     HWND status_hwnd = m_statusWindow.get_hwnd();
@@ -1166,130 +1921,32 @@ void text_service::ShowStatusWindow()
 
 void text_service::OnStatusChanged(int status_type)
 {
-    bool need_save = false;
-    bool need_refresh_candidates = false;
-    bool avoid_reposition_after_refresh = false;
-
-    // 根据状态类型更新输入法状态
     switch (status_type)
     {
     case status_window::STATUS_FULL_WIDTH:
         m_bFullWidth = m_statusWindow.is_full_width();
-        need_save = true;
-        break;
+        return;
     case status_window::STATUS_CHINESE_MODE:
     {
         const bool next_mode = m_statusWindow.is_chinese_mode();
         if (!next_mode)
-        {
             CommitCompositionCodeAndClear(nullptr);
-        }
-        m_bChineseMode = m_statusWindow.is_chinese_mode();
+        m_bChineseMode = next_mode;
         SyncPunctuationModeWithLanguageMode();
-        
-        // 同步标点状态到状态窗口
-        UpdateStatusWindow();
-        need_save = true;
-        break;
+        UpdateStatusWindow(false);
+        return;
     }
     case status_window::STATUS_PUNCTUATION:
         m_bChinesePunctuation = m_statusWindow.is_chinese_punctuation();
-        need_save = true;
-        break;
-    case status_window::STATUS_SETTINGS:
-        ShowCreateWordWindow();
-        break;
-    case status_window::STATUS_AUTO_COMMIT_FOUR_UNIQUE:
-        m_autoCommitFourCodeUnique = m_statusWindow.is_auto_commit_four_code_unique();
-        need_save = true;
-        break;
-    case status_window::STATUS_COMMIT_FIRST_CANDIDATE_ON_FIFTH_CODE:
-        m_commitFirstCandidateOnFifthCode = m_statusWindow.is_commit_first_candidate_on_fifth_code();
-        need_save = true;
-        break;
-    case status_window::STATUS_SHOW_UNCOMMON_CANDIDATES:
-        m_showUncommonCandidates = m_statusWindow.is_show_uncommon_candidates();
-        m_dictionary.set_show_uncommon_candidates(m_showUncommonCandidates);
-        need_save = true;
-        need_refresh_candidates = true;
-        avoid_reposition_after_refresh = true;
-        break;
-    case status_window::STATUS_REPLACE_DOT_AFTER_DIGIT:
-        m_replaceDotAfterDigit = m_statusWindow.is_replace_dot_after_digit();
-        need_save = true;
-        break;
-    case status_window::STATUS_USE_ENGLISH_PUNCTUATION_IN_CHINESE_MODE:
-        m_useEnglishPunctuationInChineseMode = m_statusWindow.is_use_english_punctuation_in_chinese_mode();
-        if (m_bChineseMode)
-        {
-            SyncPunctuationModeWithLanguageMode();
-            UpdateStatusWindow();
-        }
-        need_save = true;
-        break;
-    case status_window::STATUS_DISABLE_CHINESE_DASH:
-        m_disableChineseDash = m_statusWindow.is_disable_chinese_dash();
-        need_save = true;
-        break;
-    case status_window::STATUS_CANDIDATE_SORT_MODE_CHANGED:
-        m_candidateSortMode = from_status_sort_mode(m_statusWindow.get_candidate_sort_mode());
-        m_dictionary.set_candidate_sort_mode(m_candidateSortMode);
-        need_save = true;
-        need_refresh_candidates = true;
-        avoid_reposition_after_refresh = true;
-        break;
-    case status_window::STATUS_EXPORT_RAW_DICT:
-        ExportRawDictionary();
-        break;
-    case status_window::STATUS_UI_FONT_CHANGED:
-        m_uiFontPercent = m_statusWindow.get_ui_font_percent();
-        m_statusWindow.set_ui_font_percent(m_uiFontPercent);
-        m_candidateWindow.set_ui_font_percent(min(250, m_uiFontPercent + CANDIDATE_FONT_BOOST_PERCENT));
-        if (m_hCreateWordWnd && IsWindow(m_hCreateWordWnd))
-        {
-            PostMessageW(m_hCreateWordWnd, WM_CREATE_WORD_APPLY_LAYOUT, 0, 0);
-        }
-        need_save = true;
-        need_refresh_candidates = true;
-        break;
+        return;
     default:
         break;
     }
-
-    if (need_refresh_candidates && m_bInComposition && !m_compositionText.empty())
-    {
-        EnsureCandidateWindow();
-        std::vector<std::wstring> candidates;
-        std::vector<std::wstring> view_texts;
-        if (m_dictionary.get_candidates(m_compositionText, candidates, view_texts))
-        {
-            m_candidateWindow.set_composition_text(m_compositionText);
-            m_candidateWindow.set_candidates(candidates, view_texts);
-            ITfDocumentMgr* pDocMgrFocus = nullptr;
-            ITfContext* pContext = nullptr;
-            if (m_pThreadMgr && SUCCEEDED(m_pThreadMgr->GetFocus(&pDocMgrFocus)) && pDocMgrFocus)
-            {
-                pDocMgrFocus->GetTop(&pContext);
-                pDocMgrFocus->Release();
-            }
-            if (pContext)
-            {
-                if (!avoid_reposition_after_refresh)
-                    UpdateCandidateWindowPosition(pContext);
-                pContext->Release();
-            }
-            ApplyCandidateWindowVisibility();
-        }
-        else
-        {
-            m_candidateWindow.set_composition_text(m_compositionText);
-            m_candidateWindow.set_candidates(std::vector<std::wstring>());
-            HideCandidates();
-        }
-    }
-
-    if (need_save)
-        SaveRuntimeConfig();
+    UpdateStatusWindow(false);
+    MessageBoxW(m_statusWindow.get_hwnd(),
+                L"后台服务尚未连接，功能菜单暂不可用。",
+                L"提示",
+                MB_OK | MB_ICONWARNING);
 }
 
 void text_service::OnStatusWindowMoved(int x, int y)
@@ -1298,6 +1955,7 @@ void text_service::OnStatusWindowMoved(int x, int y)
     m_statusWindowPosX = x;
     m_statusWindowPosY = y;
     SaveRuntimeConfig();
+    SyncBrokerStatusState();
 }
 
 LRESULT CALLBACK text_service::CreateWordWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -1541,6 +2199,9 @@ void text_service::ShowCreateWordWindow()
 
 void text_service::OnConfirmCreateWord(HWND hWnd)
 {
+    if (m_pendingCreateWordRequest != 0)
+        return;
+
     wchar_t word_buf[256] = {};
     wchar_t code_buf[128] = {};
 
@@ -1567,78 +2228,38 @@ void text_service::OnConfirmCreateWord(HWND hWnd)
         }
     }
 
-    std::string code;
-    code.reserve(code_ws.size());
-    for (wchar_t ch : code_ws)
+    if (m_brokerClient.HasStorageWriter())
     {
-        code.push_back(static_cast<char>(ch));
-    }
-
-    std::string error;
-    if (!m_dictionary.add_custom_word(word, code, error))
-    {
-        std::wstring werr(error.begin(), error.end());
-        MessageBoxW(hWnd, (L"写入词库失败:\n" + werr).c_str(), L"错误", MB_OK | MB_ICONERROR);
+        const std::uint64_t request_id = m_brokerClient.SendStorageMutation(
+            zime::broker_protocol::storage_operation::add_custom_word,
+            code_ws,
+            word,
+            true);
+        if (request_id != 0)
+        {
+            m_pendingCreateWordRequest = request_id;
+            EnableWindow(GetDlgItem(hWnd, IDC_CREATE_OK), FALSE);
+            return;
+        }
+        MessageBoxW(hWnd,
+                    L"后台写入队列繁忙，请稍后重试。",
+                    L"提示",
+                    MB_OK | MB_ICONWARNING);
         return;
     }
 
-    MessageBoxW(hWnd, L"造词成功，已写入用户词库并即时生效。", L"提示", MB_OK | MB_ICONINFORMATION);
-    DestroyWindow(hWnd);
+    MessageBoxW(hWnd,
+                L"后台服务尚未连接，暂时不能造词。",
+                L"提示",
+                MB_OK | MB_ICONWARNING);
 }
 
 void text_service::ExportRawDictionary()
 {
-    wchar_t file_path[MAX_PATH] = {};
-    HWND owner = nullptr;
-    if (m_hCreateWordWnd && IsWindow(m_hCreateWordWnd))
-        owner = m_hCreateWordWnd;
-    if (!owner)
-        owner = get_foreground_ui_owner_window();
-    if (!owner)
-        owner = m_statusWindow.get_hwnd();
-
-    OPENFILENAMEW ofn = {};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = owner;
-    ofn.lpstrFilter = L"Dictionary Files (*.dic)\0*.dic\0All Files (*.*)\0*.*\0";
-    ofn.lpstrFile = file_path;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrDefExt = L"dic";
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-
-    if (!GetSaveFileNameW(&ofn))
-        return;
-
-    std::string error;
-    bool exported = false;
-    try
-    {
-        exported = m_dictionary.export_raw_dictionary(file_path, error);
-    }
-    catch (const std::exception& ex)
-    {
-        error = "Unhandled exception while exporting dictionary: ";
-        error += ex.what();
-    }
-    catch (...)
-    {
-        error = "Unhandled non-standard exception while exporting dictionary";
-    }
-
-    if (!exported)
-    {
-        std::wstring werr(error.begin(), error.end());
-        MessageBoxW(owner,
-                    (L"导出失败:\n" + werr).c_str(),
-                    L"错误",
-                    MB_OK | MB_ICONERROR);
-        return;
-    }
-
-    MessageBoxW(owner,
-                L"导出完成（.dic + .idx）。",
+    MessageBoxW(get_foreground_ui_owner_window(),
+                L"后台服务尚未连接，暂时不能导出词库。",
                 L"提示",
-                MB_OK | MB_ICONINFORMATION);
+                MB_OK | MB_ICONWARNING);
 }
 
 std::wstring text_service::ResolveCandidateCodeForContextMenu(const std::wstring& code_snapshot,
@@ -1671,7 +2292,15 @@ void text_service::RecordCandidateSelection(const std::wstring& code_snapshot,
     if (code_snapshot.empty() || candidate_text.empty())
         return;
     const std::wstring effective_code = ResolveCandidateCodeForContextMenu(code_snapshot, candidate_text, display_text);
-    m_dictionary.record_candidate_selected(effective_code, candidate_text);
+    if (m_brokerClient.HasStorageWriter())
+    {
+        m_brokerClient.SendStorageMutation(
+            zime::broker_protocol::storage_operation::record_selection,
+            effective_code,
+            candidate_text,
+            false);
+        return;
+    }
 }
 
 void text_service::OnCandidateContextMenu(int candidate_index, POINT screen_point)
@@ -1681,12 +2310,9 @@ void text_service::OnCandidateContextMenu(int candidate_index, POINT screen_poin
     if (candidate_index < 0 || candidate_index >= m_candidateWindow.get_candidate_count())
         return;
 
-    const std::wstring code_snapshot = m_compositionText;
     const std::wstring candidate = m_candidateWindow.get_candidate(candidate_index);
-    const std::wstring display_candidate = m_candidateWindow.get_display_candidate(candidate_index);
     if (candidate.empty())
         return;
-    const std::wstring effective_code = ResolveCandidateCodeForContextMenu(code_snapshot, candidate, display_candidate);
 
     HMENU hMenu = CreatePopupMenu();
     if (!hMenu)
@@ -1719,40 +2345,54 @@ void text_service::OnCandidateContextMenu(int candidate_index, POINT screen_poin
         return;
     }
 
-    std::string error;
-    if (cmd == IDC_CAND_MENU_DELETE)
-    {
-        if (!m_dictionary.delete_candidate(effective_code, candidate, error))
-        {
-            const std::wstring werr(error.begin(), error.end());
-            MessageBoxW(owner, (L"删除失败:\n" + werr).c_str(), L"错误", MB_OK | MB_ICONERROR);
-            return;
-        }
-    }
-    else if (cmd == IDC_CAND_MENU_MARK_UNCOMMON)
-    {
-        if (!m_dictionary.mark_candidate_uncommon(effective_code, candidate, error))
-        {
-            const std::wstring werr(error.begin(), error.end());
-            MessageBoxW(owner, (L"标记失败:\n" + werr).c_str(), L"错误", MB_OK | MB_ICONERROR);
-            return;
-        }
-    }
+    OnCandidateContextCommand(candidate_index, cmd == IDC_CAND_MENU_DELETE);
+}
 
-    // 删除后刷新当前候选列表
-    std::vector<std::wstring> candidates;
-    std::vector<std::wstring> view_texts;
-    if (!m_dictionary.get_candidates(code_snapshot, candidates, view_texts))
+void text_service::OnCandidateContextCommand(int candidate_index, bool delete_candidate)
+{
+    if (!m_bInComposition || m_compositionText.empty())
+        return;
+    if (candidate_index < 0 ||
+        candidate_index >= m_candidateWindow.get_candidate_count())
     {
-        ClearComposition();
-        HideCandidates();
         return;
     }
-    m_compositionText = code_snapshot;
-    m_bInComposition = TRUE;
-    m_candidateWindow.set_composition_text(m_compositionText);
-    m_candidateWindow.set_candidates(candidates, view_texts);
-    ApplyCandidateWindowVisibility();
+
+    const std::wstring code_snapshot = m_compositionText;
+    const std::wstring candidate = m_candidateWindow.get_candidate(candidate_index);
+    const std::wstring display_candidate =
+        m_candidateWindow.get_display_candidate(candidate_index);
+    if (candidate.empty())
+        return;
+    const std::wstring effective_code = ResolveCandidateCodeForContextMenu(
+        code_snapshot, candidate, display_candidate);
+
+    if (m_brokerClient.HasStorageWriter())
+    {
+        const auto operation = delete_candidate
+            ? zime::broker_protocol::storage_operation::delete_candidate
+            : zime::broker_protocol::storage_operation::mark_uncommon;
+        const std::uint64_t request_id = m_brokerClient.SendStorageMutation(
+            operation,
+            effective_code,
+            candidate,
+            true);
+        if (request_id != 0)
+        {
+            m_pendingCandidateStorageRequests.emplace(request_id, operation);
+            return;
+        }
+        MessageBoxW(m_brokerViewHwnd,
+                    L"后台写入队列繁忙，请稍后重试。",
+                    L"提示",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    MessageBoxW(m_brokerViewHwnd,
+                L"后台服务尚未连接，暂时不能修改词库。",
+                L"提示",
+                MB_OK | MB_ICONWARNING);
 }
 
 void text_service::OnCandidateClicked(int candidate_index)
@@ -1786,76 +2426,5 @@ void text_service::OnCandidateClicked(int candidate_index)
 
     ClearComposition();
     HideCandidates();
-}
-
-bool text_service::RebuildDictionaryIndex(std::wstring& error_msg)
-{
-    std::filesystem::path dir = tool::get_current_dll_path();
-    std::vector<std::filesystem::path> compiler_candidates = {
-        dir / "dict_compiler.exe",
-        dir.parent_path() / "dic" / "Release" / "dict_compiler.exe",
-        dir.parent_path() / "Release" / "dict_compiler.exe"
-    };
-    std::filesystem::path compiler;
-    for (const auto& p : compiler_candidates)
-    {
-        if (std::filesystem::exists(p))
-        {
-            compiler = p;
-            break;
-        }
-    }
-    std::filesystem::path dic = dir / "dict.dic";
-    std::filesystem::path idx = dir / "dict.idx";
-
-    if (compiler.empty())
-    {
-        error_msg = L"未找到 dict_compiler.exe（已检查 DLL 目录及常见构建目录）";
-        return false;
-    }
-    if (!std::filesystem::exists(dic))
-    {
-        error_msg = L"未找到 dict.dic";
-        return false;
-    }
-
-    std::wstring cmd = L"\"" + compiler.wstring() + L"\" \"" + dic.wstring() + L"\" \"" + idx.wstring() + L"\"";
-
-    STARTUPINFOW si = { 0 };
-    PROCESS_INFORMATION pi = { 0 };
-    si.cb = sizeof(si);
-
-    std::wstring work_dir = dir.wstring();
-    BOOL ok = CreateProcessW(
-        nullptr,
-        cmd.data(),
-        nullptr,
-        nullptr,
-        FALSE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        work_dir.c_str(),
-        &si,
-        &pi);
-
-    if (!ok)
-    {
-        error_msg = L"无法启动 dict_compiler.exe";
-        return false;
-    }
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exit_code = 1;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-
-    if (exit_code != 0)
-    {
-        error_msg = L"dict_compiler.exe 返回非零退出码";
-        return false;
-    }
-
-    return true;
 }
 

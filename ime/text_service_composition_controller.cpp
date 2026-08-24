@@ -1,6 +1,7 @@
 ﻿#include "text_service.h"
 
 #include <Windows.h>
+#include "perf_trace.h"
 #include <algorithm>
 #include <cwctype>
 #include <string>
@@ -79,6 +80,9 @@ public:
 
     STDMETHODIMP DoEditSession(TfEditCookie ec) override
     {
+        ZIME_PERF_SCOPE("tip.DoEditSession",
+                        static_cast<std::int64_t>(op_),
+                        static_cast<std::int64_t>(text_.size()));
         if (!service_ || !context_)
             return E_FAIL;
 
@@ -98,6 +102,9 @@ public:
 private:
     HRESULT EnsureComposition(TfEditCookie ec)
     {
+        ZIME_PERF_SCOPE("tip.EnsureComposition",
+                        service_->m_pComposition ? 1 : 0,
+                        static_cast<std::int64_t>(text_.size()));
         if (service_->m_pComposition)
             return S_OK;
 
@@ -292,6 +299,8 @@ void text_service::CommitCompositionCodeAndClear(ITfContext* pContext)
 
 void text_service::InsertRawText(ITfContext *pContext, const std::wstring& text)
 {
+    ZIME_PERF_SCOPE("tip.InsertRawText",
+                    static_cast<std::int64_t>(text.size()), 0);
     if (!pContext || text.empty())
         return;
 
@@ -299,14 +308,19 @@ void text_service::InsertRawText(ITfContext *pContext, const std::wstring& text)
         this, pContext, text, composition_edit_session::op_type::commit);
     if (pEditSession)
     {
-        HRESULT hr;
-        pContext->RequestEditSession(m_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hr);
+        HRESULT hr = E_FAIL;
+        const HRESULT request_hr = pContext->RequestEditSession(
+            m_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hr);
+        ZIME_PERF_RECORD("tip.InsertRawText.result", request_hr, hr,
+                         static_cast<std::int64_t>(text.size()));
         pEditSession->Release();
     }
 }
 
 void text_service::InsertText(ITfContext *pContext, const std::wstring& text)
 {
+    ZIME_PERF_SCOPE("tip.InsertText",
+                    static_cast<std::int64_t>(text.size()), 0);
     if (!pContext || text.empty())
         return;
 
@@ -318,15 +332,20 @@ void text_service::InsertText(ITfContext *pContext, const std::wstring& text)
         this, pContext, processed_text, composition_edit_session::op_type::commit);
     if (pEditSession)
     {
-        HRESULT hr;
+        HRESULT hr = E_FAIL;
         // 请求编辑会话
-        pContext->RequestEditSession(m_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hr);
+        const HRESULT request_hr = pContext->RequestEditSession(
+            m_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hr);
+        ZIME_PERF_RECORD("tip.InsertText.result", request_hr, hr,
+                         static_cast<std::int64_t>(processed_text.size()));
         pEditSession->Release();
     }
 }
 
 void text_service::UpdateCompositionInContext(ITfContext* pContext)
 {
+    ZIME_PERF_SCOPE("tip.UpdateComposition",
+                    static_cast<std::int64_t>(m_compositionText.size()), 0);
     if (!pContext || m_compositionText.empty())
         return;
 
@@ -334,14 +353,19 @@ void text_service::UpdateCompositionInContext(ITfContext* pContext)
         this, pContext, m_compositionText, composition_edit_session::op_type::update);
     if (pEditSession)
     {
-        HRESULT hr;
-        pContext->RequestEditSession(m_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hr);
+        HRESULT hr = E_FAIL;
+        const HRESULT request_hr = pContext->RequestEditSession(
+            m_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hr);
+        ZIME_PERF_RECORD("tip.UpdateComposition.result", request_hr, hr,
+                         static_cast<std::int64_t>(m_compositionText.size()));
         pEditSession->Release();
     }
 }
 
 void text_service::CancelCompositionInContext(ITfContext* pContext)
 {
+    ZIME_PERF_SCOPE("tip.CancelComposition",
+                    m_pComposition ? 1 : 0, 0);
     if (!m_pComposition)
         return;
 
@@ -371,8 +395,10 @@ void text_service::CancelCompositionInContext(ITfContext* pContext)
         this, context, L"", composition_edit_session::op_type::clear);
     if (pEditSession)
     {
-        HRESULT hr;
-        context->RequestEditSession(m_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hr);
+        HRESULT hr = E_FAIL;
+        const HRESULT request_hr = context->RequestEditSession(
+            m_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hr);
+        ZIME_PERF_RECORD("tip.CancelComposition.result", request_hr, hr, 0);
         pEditSession->Release();
     }
     context->Release();
@@ -382,6 +408,13 @@ void text_service::ClearComposition()
 {
     CancelCompositionInContext(nullptr);
     m_compositionText.clear();
+    m_brokerCandidateCode.clear();
+    m_brokerCommitFirstOnNextCode = false;
+    m_firstCandidateIsPinyin = false;
+    m_pendingCodeCharacters.clear();
+    m_pendingCandidateAction = pending_candidate_action::none;
+    m_pendingCandidateActionCode.clear();
+    m_pendingCandidateNumber = 0;
     m_bInComposition = FALSE;
     ClearCandidateAnchorRect();
     m_candidateWindow.set_composition_text(L"");

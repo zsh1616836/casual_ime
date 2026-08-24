@@ -16,6 +16,7 @@ public:
 	sqlite_tool& operator=(const sqlite_tool&) = delete;
 
 	int open(const std::filesystem::path& file);
+	int open(const std::filesystem::path& file, int flags);
 	int open(const std::string& file);
 	int close();
 

@@ -4,7 +4,6 @@
 #include <vector>
 #include <map>
 #include <string>
-#include <fstream>
 #include <cstdint>
 #include <filesystem>
 #include <unordered_map>
@@ -44,7 +43,7 @@ public:
 	ime_dict();
 	~ime_dict();
 
-	// 初始化词库（仅加载dict.idx）
+	// 初始化词库并将不可变基础词库完整载入内存。
 	bool init();
 	void unload();
 
@@ -54,7 +53,8 @@ public:
 	bool get_candidates(const std::wstring& code,
 	                    std::vector<std::wstring>& candidates,
 	                    std::vector<std::wstring>& view_texts,
-	                    std::vector<bool>* pinyin_flags = nullptr);
+	                    std::vector<bool>* pinyin_flags = nullptr,
+	                    std::vector<bool>* exact_match_flags = nullptr);
 	bool add_custom_word(const std::wstring& word, const std::string& code, std::string& error);
 	bool delete_candidate(const std::wstring& code, const std::wstring& candidate, std::string& error);
 	bool mark_candidate_uncommon(const std::wstring& code, const std::wstring& candidate, std::string& error);
@@ -63,11 +63,12 @@ public:
 	[[nodiscard]] bool show_uncommon_candidates() const { return m_show_uncommon_candidates; }
 	void set_candidate_sort_mode(candidate_sort_mode mode) { m_candidate_sort_mode = mode; }
 	[[nodiscard]] candidate_sort_mode get_candidate_sort_mode() const { return m_candidate_sort_mode; }
-	void record_candidate_selected(const std::wstring& code, const std::wstring& candidate);
+	bool record_candidate_selected(const std::wstring& code,
+	                               const std::wstring& candidate,
+	                               std::string* error = nullptr);
 
 private:
-	// 词库文件句柄（保持打开以便按需读取）
-	std::ifstream m_dict_file;
+	std::vector<std::uint8_t> m_dict_bytes;
 	uint32_t m_index_format_version;
 	uint64_t m_dict_file_size;
 
@@ -109,12 +110,8 @@ private:
 	bool load_blocked_dict();
 	bool load_candidate_stats();
 	std::filesystem::path get_user_db_path() const;
-	void refresh_overlay_if_changed();
 	static std::string make_candidate_stat_key(const std::string& code, const std::string& candidate_utf8);
 
-	// 从文件读取候选词
+	// 从 Broker 内存中的基础词库读取候选词。
 	bool read_candidates_from_file(uint32_t offset, uint16_t count, std::vector<Candidate>& candidates, const std::wstring& ext = L"");
-
-	std::filesystem::file_time_type m_overlay_last_write_time;
-	bool m_overlay_time_initialized;
 };

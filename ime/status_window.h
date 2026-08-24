@@ -2,6 +2,9 @@
 
 #include "globals.h"
 #include <functional>
+#include <memory>
+
+struct status_window_graphics;
 
 class status_window
 {
@@ -108,6 +111,7 @@ private:
     POINT drag_start_window_;
     HWND m_hFontSliderWnd;
     HWND m_hFontSliderTrack;
+    std::unique_ptr<status_window_graphics> graphics_;
     
     static bool class_registered;
     [[nodiscard]] int scale_px(int base_px) const;

@@ -1,6 +1,7 @@
 ﻿#include "text_service.h"
 
 #include <Windows.h>
+#include "perf_trace.h"
 #include <map>
 #include <cwctype>
 
@@ -178,6 +179,9 @@ STDAPI text_service::OnTestKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM l
 
 STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
+    ZIME_PERF_SCOPE("tip.OnKeyDown",
+                    static_cast<std::int64_t>(m_compositionText.size()),
+                    m_bInComposition ? 1 : 0);
     *pfEaten = FALSE;
 
     // 检查修饰键状态，如果有Ctrl、Alt、Win键按下，不拦截（让系统处理）
@@ -434,34 +438,7 @@ STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lPara
     {
         if (m_bInComposition && !m_compositionText.empty())
         {
-            if (m_candidateWindow.get_candidate_count() > 0)
-            {
-                // 计算当前页中的选中项的实际索引
-                int currentPage = m_candidateWindow.get_current_page();
-                int pageSize = m_candidateWindow.get_page_size();
-                int selection = m_candidateWindow.get_selection();
-                int actualIndex = currentPage * pageSize + selection;
-                const std::wstring code_snapshot = m_compositionText;
-                
-                // 直接从窗口获取原始候选词（不需要二次查询）
-                std::wstring candidate = m_candidateWindow.get_candidate(actualIndex);
-                std::wstring display_candidate = m_candidateWindow.get_display_candidate(actualIndex);
-                
-                if (!candidate.empty())
-                {
-                    RecordCandidateSelection(code_snapshot, candidate, display_candidate);
-                    InsertText(pContext, candidate);
-                    ClearComposition();
-                    HideCandidates();
-                }
-            }
-            else
-            {
-                // 如果没有候选词，插入原始输入
-                InsertText(pContext, m_compositionText);
-                ClearComposition();
-                HideCandidates();
-            }
+            HandleSpace(pContext);
             *pfEaten = TRUE;
         }
         return S_OK;
@@ -518,7 +495,11 @@ STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lPara
             {
                 m_candidateWindow.page_down();
                 m_candidateWindow.set_selection(0);  // 翻页后重置选择到第一项
-                UpdateCandidateWindowPosition(pContext);    // 更新窗口尺寸
+                if (m_brokerClient.IsConnected() &&
+                    ShouldShowBrokerCandidateWindow())
+                    SyncBrokerCandidateState();
+                else
+                    UpdateCandidateWindowPosition(pContext);
                 *pfEaten = TRUE;
             }
         }
@@ -538,7 +519,11 @@ STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lPara
             {
                 m_candidateWindow.page_up();
                 m_candidateWindow.set_selection(0);  // 翻页后重置选择到第一项
-                UpdateCandidateWindowPosition(pContext);    // 更新窗口尺寸
+                if (m_brokerClient.IsConnected() &&
+                    ShouldShowBrokerCandidateWindow())
+                    SyncBrokerCandidateState();
+                else
+                    UpdateCandidateWindowPosition(pContext);
                 *pfEaten = TRUE;
             }
         }
@@ -567,8 +552,13 @@ STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lPara
                 int endIdx = min(startIdx * pageSize + pageSize, m_candidateWindow.get_candidate_count());
                 int lastInPage = (endIdx - startIdx * pageSize) - 1;
                 m_candidateWindow.set_selection(lastInPage);
-                UpdateCandidateWindowPosition(pContext);
+                if (!m_brokerClient.IsConnected() ||
+                    !ShouldShowBrokerCandidateWindow())
+                    UpdateCandidateWindowPosition(pContext);
             }
+            if (m_brokerClient.IsConnected() &&
+                ShouldShowBrokerCandidateWindow())
+                SyncBrokerCandidateState();
             *pfEaten = TRUE;
         }
         return S_OK;
@@ -599,8 +589,13 @@ STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lPara
                 // 跳到下一页的第一个候选词
                 m_candidateWindow.page_down();
                 m_candidateWindow.set_selection(0);
-                UpdateCandidateWindowPosition(pContext);
+                if (!m_brokerClient.IsConnected() ||
+                    !ShouldShowBrokerCandidateWindow())
+                    UpdateCandidateWindowPosition(pContext);
             }
+            if (m_brokerClient.IsConnected() &&
+                ShouldShowBrokerCandidateWindow())
+                SyncBrokerCandidateState();
             *pfEaten = TRUE;
         }
         return S_OK;
@@ -626,7 +621,6 @@ STDAPI text_service::OnTestKeyUp(ITfContext *pContext, WPARAM wParam, LPARAM lPa
             m_bChineseMode = !m_bChineseMode;
             SyncPunctuationModeWithLanguageMode();
             UpdateStatusWindow();
-            SaveRuntimeConfig();
             *pfEaten = TRUE;
         }
         clear_shift_toggle_state(m_bShiftPressed, m_bOtherKeyPressed, m_bShiftPressedWithModifier);
@@ -655,7 +649,6 @@ STDAPI text_service::OnKeyUp(ITfContext *pContext, WPARAM wParam, LPARAM lParam,
             SyncPunctuationModeWithLanguageMode();
              
             UpdateStatusWindow();
-            SaveRuntimeConfig();
             *pfEaten = TRUE;
         }
         
@@ -673,16 +666,38 @@ STDAPI text_service::OnPreservedKey(ITfContext *pContext, REFGUID rguid, BOOL *p
 
 void text_service::HandleCharacter(ITfContext *pContext, WCHAR wch)
 {
+    ZIME_PERF_SCOPE("tip.HandleCharacter",
+                    static_cast<std::int64_t>(m_compositionText.size()),
+                    m_brokerClient.IsConnected() ? 1 : 0);
     const bool is_code_letter =
         (wch >= L'a' && wch <= L'z') ||
         (wch >= L'A' && wch <= L'Z');
+    if (is_code_letter &&
+        m_pendingCandidateAction != pending_candidate_action::none)
+    {
+        m_pendingCodeCharacters.push_back(wch);
+        return;
+    }
+    if (is_code_letter &&
+        m_brokerClient.IsConnected() &&
+        (m_autoCommitFourCodeUnique || m_commitFirstCandidateOnFifthCode) &&
+        m_bInComposition &&
+        m_compositionText.length() == 4 &&
+        m_brokerCandidateCode != m_compositionText)
+    {
+        if (!ResolveBrokerCandidatesSynchronously(true))
+        {
+            m_pendingCodeCharacters.push_back(wch);
+            return;
+        }
+    }
     bool defer_context_sync_once = false;
-    if (m_commitFirstCandidateOnFifthCode &&
+    if (m_brokerCommitFirstOnNextCode &&
         is_code_letter &&
         m_bInComposition &&
         m_compositionText.length() == 4 &&
-        m_candidateWindow.get_candidate_count() > 0 &&
-        !IsCurrentFirstCandidatePinyin())
+        m_brokerCandidateCode == m_compositionText &&
+        m_candidateWindow.get_candidate_count() > 0)
     {
         // 第5码输入时先上屏首候选，再把当前按键作为下一轮的第1码处理。
         // 兼容部分宿主（如钉钉/QQ）在同一按键里 commit+start composition 时出现重复落字，
@@ -693,45 +708,41 @@ void text_service::HandleCharacter(ITfContext *pContext, WCHAR wch)
 
     m_compositionText += wch;
     m_bInComposition = TRUE;
+    m_brokerCandidateLayoutReady = false;
     
     // 更新组合字符串显示
     m_candidateWindow.set_composition_text(m_compositionText);
     if (!defer_context_sync_once)
         UpdateCompositionInContext(pContext);
-    
-    // 获取候选词（原始文本和显示文本）
-    std::vector<std::wstring> candidates;
-    std::vector<std::wstring> view_texts;
-    std::vector<bool> pinyin_flags;
-    m_dictionary.get_candidates(m_compositionText, candidates, view_texts, &pinyin_flags);
-    m_candidateWindow.set_candidates(candidates, view_texts);
 
-    // 开启选项时：四码且唯一候选，且唯一候选为五笔时，直接上屏
-    if (m_autoCommitFourCodeUnique &&
+    if (is_code_letter &&
         m_compositionText.length() == 4 &&
-        candidates.size() == 1 &&
-        pinyin_flags.size() == 1 &&
-        !pinyin_flags[0] &&
-        !candidates[0].empty())
+        m_brokerClient.IsConnected() &&
+        (m_autoCommitFourCodeUnique || m_commitFirstCandidateOnFifthCode) &&
+        ResolveBrokerCandidatesSynchronously(true))
     {
-        const std::wstring code_snapshot = m_compositionText;
-        const std::wstring display_candidate = view_texts.empty() ? candidates[0] : view_texts[0];
-        RecordCandidateSelection(code_snapshot, candidates[0], display_candidate);
-        InsertText(pContext, candidates[0]);
-        ClearComposition();
-        HideCandidates();
         return;
     }
     
-    // 只要有组合字符串就显示窗口
+    m_candidateWindow.set_candidates(std::vector<std::wstring>());
     ShowCandidates(pContext);
+    RequestBrokerCandidates(true);
 }
 
 void text_service::HandleBackspace(ITfContext *pContext)
 {
+    m_pendingCandidateAction = pending_candidate_action::none;
+    m_pendingCandidateActionCode.clear();
+    m_pendingCandidateNumber = 0;
+    if (!m_pendingCodeCharacters.empty())
+    {
+        m_pendingCodeCharacters.pop_back();
+        return;
+    }
     if (!m_compositionText.empty())
     {
         m_compositionText.pop_back();
+        m_brokerCandidateLayoutReady = false;
         
         if (m_compositionText.empty())
         {
@@ -745,20 +756,29 @@ void text_service::HandleBackspace(ITfContext *pContext)
             m_candidateWindow.set_composition_text(m_compositionText);
             UpdateCompositionInContext(pContext);
             
-            // 获取候选词（原始文本和显示文本）
-            std::vector<std::wstring> candidates;
-            std::vector<std::wstring> view_texts;
-            m_dictionary.get_candidates(m_compositionText, candidates, view_texts);
-            m_candidateWindow.set_candidates(candidates, view_texts);
-            
-            // 只要有组合字符串就显示窗口
+            m_candidateWindow.set_candidates(std::vector<std::wstring>());
             ShowCandidates(pContext);
+            RequestBrokerCandidates();
         }
     }
 }
 
 void text_service::HandleSpace(ITfContext *pContext)
 {
+    if (m_bInComposition &&
+        m_brokerClient.IsConnected() &&
+        m_brokerCandidateCode != m_compositionText)
+    {
+        if (!ResolveBrokerCandidatesSynchronously(false))
+        {
+            m_pendingCandidateAction = pending_candidate_action::space;
+            m_pendingCandidateActionCode = m_compositionText;
+            m_pendingCandidateNumber = 0;
+            return;
+        }
+        if (!m_bInComposition)
+            return;
+    }
     if (m_bInComposition && m_candidateWindow.get_candidate_count() > 0)
     {
         // 插入第一个候选词
@@ -775,6 +795,21 @@ void text_service::HandleSpace(ITfContext *pContext)
 
 void text_service::HandleNumber(ITfContext *pContext, int num)
 {
+    if (m_bInComposition &&
+        num > 0 &&
+        m_brokerClient.IsConnected() &&
+        m_brokerCandidateCode != m_compositionText)
+    {
+        if (!ResolveBrokerCandidatesSynchronously(false))
+        {
+            m_pendingCandidateAction = pending_candidate_action::number;
+            m_pendingCandidateActionCode = m_compositionText;
+            m_pendingCandidateNumber = num;
+            return;
+        }
+        if (!m_bInComposition)
+            return;
+    }
     if (m_bInComposition && num > 0 && num <= m_candidateWindow.get_candidate_count())
     {
         // 计算当前页中对应数字键的实际索引
@@ -825,19 +860,10 @@ void text_service::CommitFirstCandidateOrComposition(ITfContext *pContext)
 
 bool text_service::IsCurrentFirstCandidatePinyin()
 {
-    if (!m_bInComposition || m_compositionText.empty() || m_candidateWindow.get_candidate_count() <= 0)
-        return false;
-
-    std::vector<std::wstring> candidates;
-    std::vector<std::wstring> view_texts;
-    std::vector<bool> pinyin_flags;
-    if (!m_dictionary.get_candidates(m_compositionText, candidates, view_texts, &pinyin_flags))
-        return false;
-
-    if (candidates.empty() || pinyin_flags.empty())
-        return false;
-
-    return pinyin_flags[0];
+    return m_bInComposition &&
+        m_brokerCandidateCode == m_compositionText &&
+        m_candidateWindow.get_candidate_count() > 0 &&
+        m_firstCandidateIsPinyin;
 }
 
 std::wstring text_service::ConvertToFullWidth(const std::wstring& text)

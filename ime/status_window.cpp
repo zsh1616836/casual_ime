@@ -7,6 +7,7 @@
 #include <array>
 
 #include "tool.h"
+#include "../common/default_settings.h"
 
 constexpr auto STATUSWINDOW_CLASS = L"SimpleTSFStatusWindow";
 constexpr auto STATUS_FONT_SLIDER_WINDOW_CLASS = L"SimpleTSFFontSliderWindow";
@@ -25,22 +26,6 @@ UINT resolve_window_dpi(HWND hwnd)
     return 96;
 }
 
-bool ensure_gdiplus_started()
-{
-    static bool started = false;
-    static ULONG_PTR token = 0;
-    if (started)
-        return true;
-
-    Gdiplus::GdiplusStartupInput input;
-    if (Gdiplus::GdiplusStartup(&token, &input, nullptr) == Gdiplus::Ok)
-    {
-        started = true;
-        return true;
-    }
-    return false;
-}
-
 std::filesystem::path locate_icon_path(std::initializer_list<const wchar_t*> names)
 {
     const std::filesystem::path dll_dir = tool::get_current_dll_path();
@@ -52,14 +37,21 @@ std::filesystem::path locate_icon_path(std::initializer_list<const wchar_t*> nam
         dll_dir.parent_path().parent_path().parent_path(),
         cwd
     };
+    const std::array<std::filesystem::path, 2> icon_directories = {
+        std::filesystem::path(L"ico"),
+        std::filesystem::path(L"assets") / L"status-icons"
+    };
     for (const auto& name : names)
     {
         for (const auto& root : roots)
         {
-            std::error_code ec;
-            const auto p = root / L"ico" / name;
-            if (std::filesystem::exists(p, ec))
-                return p;
+            for (const auto& icon_directory : icon_directories)
+            {
+                std::error_code ec;
+                const auto p = root / icon_directory / name;
+                if (std::filesystem::exists(p, ec))
+                    return p;
+            }
         }
     }
     return {};
@@ -78,14 +70,44 @@ enum class StatusIconId : size_t
     Count
 };
 
-Gdiplus::Image* load_status_icon(StatusIconId id)
+}
+
+struct status_window_graphics
 {
-    static std::array<std::unique_ptr<Gdiplus::Image>, static_cast<size_t>(StatusIconId::Count)> icons;
-    static std::array<bool, static_cast<size_t>(StatusIconId::Count)> tried = {};
+    ~status_window_graphics()
+    {
+        for (auto& icon : icons)
+            icon.reset();
+        if (token != 0)
+            Gdiplus::GdiplusShutdown(token);
+    }
+
+    bool ensure_started()
+    {
+        if (token != 0)
+            return true;
+        Gdiplus::GdiplusStartupInput input;
+        return Gdiplus::GdiplusStartup(&token, &input, nullptr) == Gdiplus::Ok;
+    }
+
+    ULONG_PTR token = 0;
+    std::array<std::unique_ptr<Gdiplus::Image>,
+               static_cast<size_t>(StatusIconId::Count)> icons;
+    std::array<bool, static_cast<size_t>(StatusIconId::Count)> tried = {};
+};
+
+namespace
+{
+
+Gdiplus::Image* load_status_icon(status_window_graphics* graphics,
+                                 StatusIconId id)
+{
+    if (!graphics)
+        return nullptr;
     const size_t idx = static_cast<size_t>(id);
-    if (tried[idx])
-        return icons[idx].get();
-    tried[idx] = true;
+    if (graphics->tried[idx])
+        return graphics->icons[idx].get();
+    graphics->tried[idx] = true;
 
     std::filesystem::path path;
     switch (id)
@@ -119,15 +141,15 @@ Gdiplus::Image* load_status_icon(StatusIconId id)
     }
     if (path.empty())
         return nullptr;
-    if (!ensure_gdiplus_started())
+    if (!graphics->ensure_started())
         return nullptr;
 
     auto image = std::make_unique<Gdiplus::Image>(path.c_str());
     if (image->GetLastStatus() != Gdiplus::Ok)
         return nullptr;
 
-    icons[idx] = std::move(image);
-    return icons[idx].get();
+    graphics->icons[idx] = std::move(image);
+    return graphics->icons[idx].get();
 }
 
 void draw_icon_aspect_fit(Gdiplus::Graphics& g, Gdiplus::Image* icon, const RECT& slot, int pad_px)
@@ -171,19 +193,26 @@ bool status_window::class_registered = false;
 status_window::status_window()
 {
     m_hWnd = nullptr;
-    is_full_width_ = false;          // 默认半角
-    is_chinese_mode_ = true;         // 默认中文模式
-    is_chinese_punctuation_ = false;  // 默认英文标点
-    is_auto_commit_four_code_unique_ = true; // 默认开启
-    is_commit_first_candidate_on_fifth_code_ = true; // 默认开启
-    is_show_uncommon_candidates_ = false; // 默认不显示
-    is_replace_dot_after_digit_ = true; // 默认开启
-    is_use_english_punctuation_in_chinese_mode_ = true; // 默认开启
-    is_disable_chinese_dash_ = true; // 默认开启
-    candidate_sort_mode_ = CandidateSortMode::Frequency; // 默认按词频排序
+    is_full_width_ = zime::default_settings::full_width;
+    is_chinese_mode_ = zime::default_settings::chinese_mode;
+    is_chinese_punctuation_ = zime::default_settings::chinese_punctuation;
+    is_auto_commit_four_code_unique_ =
+        zime::default_settings::auto_commit_four_code_unique;
+    is_commit_first_candidate_on_fifth_code_ =
+        zime::default_settings::commit_first_candidate_on_fifth_code;
+    is_show_uncommon_candidates_ =
+        zime::default_settings::show_uncommon_candidates;
+    is_replace_dot_after_digit_ =
+        zime::default_settings::replace_dot_after_digit;
+    is_use_english_punctuation_in_chinese_mode_ =
+        zime::default_settings::use_english_punctuation_in_chinese_mode;
+    is_disable_chinese_dash_ = zime::default_settings::disable_chinese_dash;
+    candidate_sort_mode_ = static_cast<CandidateSortMode>(
+        zime::default_settings::candidate_sort_mode);
     hover_button_ = -1;
     status_change_callback_ = nullptr;
-    ui_font_percent_ = 100;
+    ui_font_percent_ = static_cast<int>(
+        zime::default_settings::ui_font_percent);
     position_changed_callback_ = nullptr;
     is_dragging_ = false;
     drag_start_cursor_ = { 0, 0 };
@@ -219,6 +248,8 @@ void status_window::register_window_class()
 
 BOOL status_window::create(HWND hWndParent)
 {
+    if (!graphics_)
+        graphics_ = std::make_unique<status_window_graphics>();
     register_window_class();
     INITCOMMONCONTROLSEX icex = {};
     icex.dwSize = sizeof(icex);
@@ -240,22 +271,25 @@ BOOL status_window::create(HWND hWndParent)
         g_hInst,
         this);
 
+    if (!m_hWnd)
+        graphics_.reset();
     return (m_hWnd != nullptr);
 }
 
 void status_window::destroy()
 {
-    if (m_hFontSliderWnd)
+    if (m_hFontSliderWnd && IsWindow(m_hFontSliderWnd))
     {
         DestroyWindow(m_hFontSliderWnd);
-        m_hFontSliderWnd = nullptr;
-        m_hFontSliderTrack = nullptr;
     }
-    if (m_hWnd)
+    m_hFontSliderWnd = nullptr;
+    m_hFontSliderTrack = nullptr;
+    if (m_hWnd && IsWindow(m_hWnd))
     {
         DestroyWindow(m_hWnd);
-        m_hWnd = nullptr;
     }
+    m_hWnd = nullptr;
+    graphics_.reset();
 }
 
 void status_window::show(bool bShow) const
@@ -281,6 +315,31 @@ void status_window::move(int x, int y) const
         int window_width = 0;
         int window_height = 0;
         recalc_window_size(window_width, window_height);
+
+        RECT proposed = {x, y, x + window_width, y + window_height};
+        HMONITOR monitor = MonitorFromRect(&proposed, MONITOR_DEFAULTTONULL);
+        if (!monitor)
+        {
+            const HWND owner = GetWindow(m_hWnd, GW_OWNER);
+            monitor = MonitorFromWindow(owner ? owner : m_hWnd,
+                                        MONITOR_DEFAULTTONEAREST);
+        }
+
+        MONITORINFO info = {};
+        info.cbSize = sizeof(info);
+        if (monitor && GetMonitorInfoW(monitor, &info))
+        {
+            const RECT& work = info.rcWork;
+            if (window_width >= work.right - work.left)
+                x = work.left;
+            else
+                x = max(work.left, min(x, work.right - window_width));
+            if (window_height >= work.bottom - work.top)
+                y = work.top;
+            else
+                y = max(work.top, min(y, work.bottom - window_height));
+        }
+
         SetWindowPos(m_hWnd, HWND_TOPMOST, x, y, window_width, window_height, SWP_NOACTIVATE);
     }
 }
@@ -984,6 +1043,17 @@ LRESULT CALLBACK status_window::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             return 0;
         }
         break;
+    case WM_NCDESTROY:
+        if (pThis)
+        {
+            SetWindowLongPtr(hWnd, GWLP_USERDATA, 0);
+            if (pThis->m_hWnd == hWnd)
+            {
+                pThis->m_hWnd = nullptr;
+                pThis->graphics_.reset();
+            }
+        }
+        break;
     default:
         break;
     }
@@ -1024,7 +1094,8 @@ void status_window::on_paint(HDC hdc) const
     SelectObject(hdc, old_main_pen);
     DeleteObject(main_bg);
 
-    if (Gdiplus::Image* main_icon = load_status_icon(StatusIconId::Main))
+    if (Gdiplus::Image* main_icon =
+            load_status_icon(graphics_.get(), StatusIconId::Main))
     {
         Gdiplus::Graphics g(hdc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
@@ -1065,7 +1136,8 @@ void status_window::on_paint(HDC hdc) const
         else if (i == 2)
             icon_id = is_full_width_ ? StatusIconId::Full : StatusIconId::Half;
 
-        if (Gdiplus::Image* icon = load_status_icon(icon_id))
+        if (Gdiplus::Image* icon =
+                load_status_icon(graphics_.get(), icon_id))
         {
             Gdiplus::Graphics g(hdc);
             g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);

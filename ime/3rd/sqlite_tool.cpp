@@ -42,15 +42,26 @@ sqlite_tool::~sqlite_tool()
 }
 
 int sqlite_tool::open(const std::filesystem::path& file)
+
+{
+	return open(file, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+}
+
+int sqlite_tool::open(const std::filesystem::path& file, int flags)
 {
 	if (opened_)
 		return SQLITE_MISUSE;
 	const std::string file_utf8 = path_to_utf8(file);
 	if (file_utf8.empty() && !file.empty())
 		return SQLITE_CANTOPEN;
-	const int rc = sqlite3_open(file_utf8.c_str(), &db_);
+	const int rc = sqlite3_open_v2(file_utf8.c_str(), &db_, flags, nullptr);
 	if (rc == SQLITE_OK)
 		opened_ = true;
+	else if (db_)
+	{
+		sqlite3_close(db_);
+		db_ = nullptr;
+	}
 	return rc;
 }
 

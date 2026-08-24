@@ -132,6 +132,8 @@ STDMETHODIMP candidate_ui_element::GetSelection(UINT *puIndex)
 {
     if (puIndex == nullptr)
         return E_INVALIDARG;
+    if (candidates_.empty() || selection_ >= candidates_.size())
+        return S_FALSE;
     *puIndex = selection_;
     return S_OK;
 }
@@ -188,6 +190,8 @@ STDMETHODIMP candidate_ui_element::GetCurrentPage(UINT *puPage)
 
 STDMETHODIMP candidate_ui_element::SetSelection(UINT nIndex)
 {
+    if (nIndex >= candidates_.size())
+        return E_INVALIDARG;
     selection_ = nIndex;
     updated_flags_ |= TF_CLUIE_SELECTION;
     if (selection_callback_)
@@ -276,6 +280,11 @@ void candidate_ui_element::set_key_down_callback(std::function<bool(WPARAM, LPAR
 void candidate_ui_element::set_finalize_exact_callback(std::function<void()> callback)
 {
     finalize_exact_callback_ = std::move(callback);
+}
+
+void candidate_ui_element::set_initial_show_state(BOOL shown)
+{
+    shown_ = shown ? TRUE : FALSE;
 }
 
 void candidate_ui_element::update_state(const std::vector<std::wstring> &candidates,

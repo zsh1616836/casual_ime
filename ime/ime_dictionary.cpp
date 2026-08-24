@@ -2,8 +2,10 @@
 #include <Windows.h>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include <cwctype>
@@ -90,6 +92,15 @@ bool open_overlay_db(const std::filesystem::path& path, sqlite_tool& db, std::st
 	return true;
 }
 
+bool open_overlay_db_read_only(const std::filesystem::path& path,
+	                           sqlite_tool& db)
+{
+	std::error_code error;
+	if (!std::filesystem::is_regular_file(path, error) || error)
+		return false;
+	return db.open(path, SQLITE_OPEN_READONLY) == SQLITE_OK;
+}
+
 bool write_utf8_lines_atomic(const std::filesystem::path& path,
                              const std::vector<std::string>& lines,
                              bool write_bom,
@@ -149,8 +160,7 @@ ime_dict::ime_dict()
 		  m_index_format_version(0),
 		  m_dict_file_size(0),
 		  m_show_uncommon_candidates(false),
-		  m_candidate_sort_mode(candidate_sort_mode::frequency),
-		  m_overlay_time_initialized(false)
+		  m_candidate_sort_mode(candidate_sort_mode::frequency)
 {
 	// 预留索引0为"无编码"标记
 	m_wubi_code_pool.push_back("");
@@ -158,10 +168,6 @@ ime_dict::ime_dict()
 
 ime_dict::~ime_dict()
 {
-	if (m_dict_file.is_open())
-	{
-		m_dict_file.close();
-	}
 }
 
 bool ime_dict::init()
@@ -183,11 +189,7 @@ bool ime_dict::init()
 
 void ime_dict::unload()
 {
-	if (m_dict_file.is_open())
-	{
-		m_dict_file.close();
-	}
-	m_dict_file.clear();
+	m_dict_bytes.clear();
 	m_code_index.clear();
 	m_wubi_code_pool.clear();
 	m_wubi_code_pool.push_back("");
@@ -198,16 +200,11 @@ void ime_dict::unload()
 	m_use_file_dict = false;
 	m_index_format_version = 0;
 	m_dict_file_size = 0;
-	m_overlay_time_initialized = false;
 }
 
 bool ime_dict::load_from_index(const char* filename)
 {
-	if (m_dict_file.is_open())
-	{
-		m_dict_file.close();
-	}
-	m_dict_file.clear();
+	m_dict_bytes.clear();
 	m_dict_file_size = 0;
 
 	std::filesystem::path pwd = tool::get_current_dll_path();
@@ -317,19 +314,21 @@ bool ime_dict::load_from_index(const char* filename)
 			return false;
 	}
 
-	fin.close();
-
-	// 打开词库文件用于按需读取（使用相同的完整路径）
-	m_dict_file.open(pwd, std::ios::binary);
-	if (!m_dict_file.is_open())
+	if (file_size > (std::numeric_limits<std::size_t>::max)() ||
+		file_size > static_cast<uint64_t>((std::numeric_limits<std::streamsize>::max)()))
+	{
 		return false;
-	m_dict_file.seekg(0, std::ios::end);
-	const std::streamoff dict_end = m_dict_file.tellg();
-	if (dict_end <= 0)
+	}
+	m_dict_bytes.resize(static_cast<std::size_t>(file_size));
+	fin.clear();
+	fin.seekg(0, std::ios::beg);
+	if (!fin.read(reinterpret_cast<char*>(m_dict_bytes.data()),
+		static_cast<std::streamsize>(m_dict_bytes.size())))
+	{
+		m_dict_bytes.clear();
 		return false;
-	m_dict_file_size = static_cast<uint64_t>(dict_end);
-	m_dict_file.clear();
-	m_dict_file.seekg(0, std::ios::beg);
+	}
+	m_dict_file_size = file_size;
 
 	return true;
 }
@@ -399,7 +398,7 @@ bool ime_dict::add_custom_word(const std::wstring& word, const std::string& code
 
 std::filesystem::path ime_dict::get_user_db_path() const
 {
-	return tool::get_current_dll_path() / L"user_dict.db";
+	return tool::get_user_data_path() / L"user_dict.db";
 }
 
 std::string ime_dict::make_candidate_stat_key(const std::string& code, const std::string& candidate_utf8)
@@ -415,9 +414,12 @@ std::string ime_dict::make_candidate_stat_key(const std::string& code, const std
 bool ime_dict::load_user_dict()
 {
 	m_user_code_to_candidates.clear();
-	std::string error;
+	const std::filesystem::path path = get_user_db_path();
+	std::error_code file_error;
+	if (!std::filesystem::exists(path, file_error))
+		return true;
 	sqlite_tool db;
-	if (!open_overlay_db(get_user_db_path(), db, error))
+	if (!open_overlay_db_read_only(path, db))
 		return false;
 
 	sqlite3_stmt* stmt = nullptr;
@@ -447,9 +449,12 @@ bool ime_dict::load_blocked_dict()
 {
 	m_blocked_candidates.clear();
 	m_runtime_uncommon_candidates.clear();
-	std::string error;
+	const std::filesystem::path path = get_user_db_path();
+	std::error_code file_error;
+	if (!std::filesystem::exists(path, file_error))
+		return true;
 	sqlite_tool db;
-	if (!open_overlay_db(get_user_db_path(), db, error))
+	if (!open_overlay_db_read_only(path, db))
 		return false;
 
 	sqlite3_stmt* blocked_stmt = nullptr;
@@ -485,9 +490,12 @@ bool ime_dict::load_blocked_dict()
 bool ime_dict::load_candidate_stats()
 {
 	m_candidate_usage_stats.clear();
-	std::string error;
+	const std::filesystem::path path = get_user_db_path();
+	std::error_code file_error;
+	if (!std::filesystem::exists(path, file_error))
+		return true;
 	sqlite_tool db;
-	if (!open_overlay_db(get_user_db_path(), db, error))
+	if (!open_overlay_db_read_only(path, db))
 		return false;
 
 	sqlite3_stmt* stmt = nullptr;
@@ -653,22 +661,36 @@ bool ime_dict::mark_candidate_uncommon(const std::wstring& code, const std::wstr
 	return true;
 }
 
-void ime_dict::record_candidate_selected(const std::wstring& code, const std::wstring& candidate)
+bool ime_dict::record_candidate_selected(const std::wstring& code,
+	                                     const std::wstring& candidate,
+	                                     std::string* error_out)
 {
 	if (code.empty() || candidate.empty())
-		return;
+	{
+		if (error_out)
+			*error_out = "Code or candidate is empty";
+		return false;
+	}
 
 	const std::string narrow_code = wstring_to_utf8(code);
 	const std::string cand_utf8 = wstring_to_utf8(candidate);
 	if (narrow_code.empty() || cand_utf8.empty())
-		return;
+	{
+		if (error_out)
+			*error_out = "Cannot encode code or candidate";
+		return false;
+	}
 
 	const int64_t now = static_cast<int64_t>(std::time(nullptr));
 
 	std::string error;
 	sqlite_tool db;
 	if (!open_overlay_db(get_user_db_path(), db, error))
-		return;
+	{
+		if (error_out)
+			*error_out = error;
+		return false;
+	}
 
 	sqlite3_stmt* stmt = nullptr;
 	if (db.prepare(
@@ -678,7 +700,9 @@ void ime_dict::record_candidate_selected(const std::wstring& code, const std::ws
 		"last_used_at = excluded.last_used_at;",
 		&stmt) != SQLITE_OK)
 	{
-		return;
+		if (error_out)
+			*error_out = db.last_error();
+		return false;
 	}
 
 	bind_text(stmt, 1, narrow_code);
@@ -686,8 +710,10 @@ void ime_dict::record_candidate_selected(const std::wstring& code, const std::ws
 	sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(now));
 	if (!run_sqlite_stmt(stmt))
 	{
+		if (error_out)
+			*error_out = db.last_error();
 		sqlite_tool::finalize(stmt);
-		return;
+		return false;
 	}
 	sqlite_tool::finalize(stmt);
 
@@ -697,6 +723,7 @@ void ime_dict::record_candidate_selected(const std::wstring& code, const std::ws
 		stat.use_count = 0;
 	stat.use_count += 1;
 	stat.last_used_at = now;
+	return true;
 }
 
 bool ime_dict::export_raw_dictionary(const std::filesystem::path& output_path, std::string& error)
@@ -940,9 +967,9 @@ bool ime_dict::export_raw_dictionary(const std::filesystem::path& output_path, s
 
 bool ime_dict::read_candidates_from_file(uint32_t offset, uint16_t count, std::vector<Candidate>& candidates, const std::wstring& ext)
 {
-	if (!m_dict_file.is_open())
+	if (m_dict_bytes.empty())
 	{
-		OutputDebugStringA("ERROR: dict_file is not open\n");
+		OutputDebugStringA("ERROR: dictionary memory is empty\n");
 		return false;
 	}
 	if (count == 0)
@@ -953,21 +980,16 @@ bool ime_dict::read_candidates_from_file(uint32_t offset, uint16_t count, std::v
 	// candidates.clear();
 	// candidates.reserve(count);
 	candidates.reserve(candidates.size() + count);
-	m_dict_file.clear();
-
-	// Seek到指定位置
-	m_dict_file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-	if (!m_dict_file.good())
-	{
-		return false;
-	}
 	uint64_t cursor = static_cast<uint64_t>(offset);
 	const uint64_t candidate_header_size = (m_index_format_version >= 4) ? 9ULL :
 	                                       ((m_index_format_version >= 3) ? 8ULL : 6ULL);
-	auto read_bytes = [this](void* dst, size_t sz) -> bool {
+	auto read_bytes = [this, &cursor](void* dst, size_t sz) -> bool {
 		if (sz == 0)
 			return true;
-		return static_cast<bool>(m_dict_file.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(sz)));
+		if (cursor > m_dict_bytes.size() || sz > m_dict_bytes.size() - cursor)
+			return false;
+		std::memcpy(dst, m_dict_bytes.data() + cursor, sz);
+		return true;
 	};
 
 	// 读取候选词
@@ -1111,14 +1133,15 @@ bool ime_dict::get_more(const std::string& narrow_code, std::vector<Candidate>& 
 bool ime_dict::get_candidates(const std::wstring& code,
                               std::vector<std::wstring>& candidates,
                               std::vector<std::wstring>& view_texts,
-                              std::vector<bool>* pinyin_flags)
+                              std::vector<bool>* pinyin_flags,
+                              std::vector<bool>* exact_match_flags)
 {
 	candidates.clear();
 	view_texts.clear();
 	if (pinyin_flags)
 		pinyin_flags->clear();
-	refresh_overlay_if_changed();
-
+	if (exact_match_flags)
+		exact_match_flags->clear();
 	// 转换宽字符编码为窄字符
 	std::string narrow_code = wstring_to_utf8(code);
 
@@ -1253,6 +1276,8 @@ bool ime_dict::get_candidates(const std::wstring& code,
 	view_texts.reserve(ranked.size());
 	if (pinyin_flags)
 		pinyin_flags->reserve(ranked.size());
+	if (exact_match_flags)
+		exact_match_flags->reserve(ranked.size());
 
 	for (const RankedCandidate& ranked_cand : ranked)
 	{
@@ -1261,26 +1286,11 @@ bool ime_dict::get_candidates(const std::wstring& code,
 		view_texts.push_back(generate_view_text(cand));
 		if (pinyin_flags)
 			pinyin_flags->push_back(cand.is_pinyin());
+		if (exact_match_flags)
+			exact_match_flags->push_back(cand.prompt.empty());
 	}
 
 	return !candidates.empty();
-}
-
-void ime_dict::refresh_overlay_if_changed()
-{
-	const std::filesystem::path db_path = get_user_db_path();
-	std::error_code ec;
-	std::filesystem::file_time_type last_write = (std::filesystem::file_time_type::min)();
-	if (std::filesystem::exists(db_path, ec))
-		last_write = std::filesystem::last_write_time(db_path, ec);
-	if (!m_overlay_time_initialized || last_write != m_overlay_last_write_time)
-	{
-		load_user_dict();
-		load_blocked_dict();
-		load_candidate_stats();
-		m_overlay_last_write_time = last_write;
-		m_overlay_time_initialized = true;
-	}
 }
 
 uint32_t ime_dict::get_or_create_wubi_code_index(const std::string& wubi_code)

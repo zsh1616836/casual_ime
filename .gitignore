@@ -1,4 +1,15 @@
 build/
 .vscode/
 build32/
-test/
+build-perf/
+build32-perf/
+dist/
+out/
+*.dll
+*.exe
+*.pdb
+*.msi
+*.msix
+*.log
+config.ini
+user_dict.db*

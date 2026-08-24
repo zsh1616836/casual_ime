@@ -56,6 +56,8 @@ public:
     void set_context_menu_callback(CandidateContextMenuCallback callback) { context_menu_callback_ = std::move(callback); }
     using CandidateClickCallback = std::function<void(int)>;
     void set_click_callback(CandidateClickCallback callback) { click_callback_ = std::move(callback); }
+    using PageChangeCallback = std::function<void(int)>;
+    void set_page_change_callback(PageChangeCallback callback) { page_change_callback_ = std::move(callback); }
     void set_ui_font_percent(int percent);
     void get_window_size(int& width, int& height) const;
     [[nodiscard]] int get_window_width() const;
@@ -104,6 +106,7 @@ private:
     bool get_page_button_rects(RECT& prev_rect, RECT& next_rect) const;
     CandidateContextMenuCallback context_menu_callback_;
     CandidateClickCallback click_callback_;
+    PageChangeCallback page_change_callback_;
     int ui_font_percent_;
     void calc_window_size(int& width, int& height) const;
 

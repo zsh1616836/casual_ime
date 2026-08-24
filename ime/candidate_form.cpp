@@ -117,6 +117,9 @@ void candidate_form::get_window_size(int& width, int& height) const
 
 void candidate_form::set_candidates(const std::vector<std::wstring>& candidates)
 {
+	if (!use_display_text_ && candidates_ == candidates)
+		return;
+
 	candidates_ = candidates;
 	original_candidates_.clear();
 	display_candidates_.clear();
@@ -137,12 +140,17 @@ void candidate_form::set_candidates(const std::vector<std::wstring>& candidates)
 
 void candidate_form::set_candidates(const std::vector<std::wstring>& original, const std::vector<std::wstring>& display)
 {
-	original_candidates_ = original;
-	display_candidates_ = display;
-	if (display_candidates_.size() > original_candidates_.size())
+	std::vector<std::wstring> clipped_display = display;
+	if (clipped_display.size() > original.size())
+		clipped_display.resize(original.size());
+	if (use_display_text_ && original_candidates_ == original &&
+		display_candidates_ == clipped_display)
 	{
-		display_candidates_.resize(original_candidates_.size());
+		return;
 	}
+
+	original_candidates_ = original;
+	display_candidates_ = std::move(clipped_display);
 	candidates_.clear();
 	use_display_text_ = true;
 	selection_ = 0;
@@ -193,6 +201,9 @@ std::wstring candidate_form::get_display_candidate(int index) const
 
 void candidate_form::set_composition_text(const std::wstring& text)
 {
+	if (composition_text_ == text)
+		return;
+
 	composition_text_ = text;
 
 	if (m_hWnd)
@@ -217,6 +228,8 @@ void candidate_form::set_selection(int nSelection)
 	// 确保选择在当前页范围内
 	if (nSelection >= 0 && nSelection < items_in_page)
 	{
+		if (selection_ == nSelection)
+			return;
 		selection_ = nSelection;
 		if (m_hWnd)
 		{
@@ -605,6 +618,8 @@ void candidate_form::set_ui_font_percent(int percent)
 		percent = 80;
 	if (percent > 250)
 		percent = 250;
+	if (ui_font_percent_ == percent)
+		return;
 	ui_font_percent_ = percent;
 	if (m_hWnd)
 	{
@@ -733,12 +748,16 @@ void candidate_form::on_lbutton_up(int x, int y)
 	{
 		page_up();
 		set_selection(0);
+		if (page_change_callback_)
+			page_change_callback_(current_page);
 		return;
 	}
 	if (page_button == 1)
 	{
 		page_down();
 		set_selection(0);
+		if (page_change_callback_)
+			page_change_callback_(current_page);
 		return;
 	}
 

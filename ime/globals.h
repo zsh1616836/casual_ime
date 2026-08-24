@@ -29,6 +29,9 @@ BOOL register_categories();
 BOOL unregister_categories();
 BOOL register_profile();
 BOOL unregister_profile();
+BOOL register_broker_installation();
+BOOL unregister_broker_installation();
+void registration_trace(const wchar_t* stage, HRESULT result);
 
 // 工具函数
 void dll_add_ref();

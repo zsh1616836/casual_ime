@@ -47,6 +47,7 @@ public:
     void set_abort_callback(std::function<void()> callback);
     void set_key_down_callback(std::function<bool(WPARAM, LPARAM)> callback);
     void set_finalize_exact_callback(std::function<void()> callback);
+    void set_initial_show_state(BOOL shown);
     void update_state(const std::vector<std::wstring> &candidates,
                       const std::vector<UINT> &page_index,
                       UINT current_page,

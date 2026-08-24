@@ -1,0 +1,5 @@
+*.idx binary
+*.png binary
+*.ico binary
+*.xlsx binary
+packaging/default-config.ini text eol=lf

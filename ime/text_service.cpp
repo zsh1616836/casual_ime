@@ -1,4 +1,8 @@
 ﻿#include "text_service.h"
+#include "ime_trace.h"
+#include "perf_trace.h"
+#include "../common/default_settings.h"
+#include "search_candidate_provider.h"
 #include <olectl.h>
 #include <map>
 #include <Windows.h>
@@ -508,30 +512,53 @@ text_service::text_service()
     m_dwKeyEventSinkCookie = TF_INVALID_COOKIE;
     m_dwTextLayoutSinkCookie = TF_INVALID_COOKIE;
     m_pTextLayoutSinkContext = nullptr;
+    m_functionProviderAdvised = false;
+    m_searchCandidateProvider = nullptr;
+    m_inputModeCompartment = nullptr;
+    m_inputModeCompartmentSinkCookie = TF_INVALID_COOKIE;
+    m_updatingInputModeCompartment = false;
+    m_pendingCreateWordRequest = 0;
+    m_hasBrokerConfig = false;
+    m_brokerConfigRevision = 0;
+    m_brokerCommitFirstOnNextCode = false;
+    m_firstCandidateIsPinyin = false;
+    m_pendingCandidateAction = pending_candidate_action::none;
+    m_pendingCandidateNumber = 0;
     m_candidateUIElement = nullptr;
     m_candidateUIElementId = TF_INVALID_UIELEMENTID;
     m_hostWantsCandidateWindow = true;
     m_uiElementOnlyMode = false;
     m_immersiveMode = false;
+    m_brokerViewHwnd = nullptr;
     SetRectEmpty(&m_lastCandidateAnchorRect);
     m_hasLastCandidateAnchorRect = false;
     m_lastCandidateAnchorTick = 0;
     m_lastCandidateAnchorOwner = nullptr;
+    m_candidatePositionEditPending = false;
+    m_brokerCandidateLayoutReady = false;
     m_hCreateWordWnd = NULL;
     m_bInComposition = FALSE;
     m_pComposition = nullptr;
-    m_bChineseMode = TRUE; // 默认中文模式
-    m_bFullWidth = FALSE;  // 默认半角
-    m_bChinesePunctuation = FALSE;  // 默认英文标点
-    m_autoCommitFourCodeUnique = true; // 默认开启：四码唯一时直接上屏
-    m_commitFirstCandidateOnFifthCode = true; // 默认开启：第5码时上屏首个候选词
-    m_showUncommonCandidates = false; // 默认不显示不常用词
-    m_replaceDotAfterDigit = true; // 默认开启：数字后"。"替换为"."
-    m_useEnglishPunctuationInChineseMode = true; // 默认开启
-    m_disableChineseDash = true; // 默认开启
-    m_candidateSortMode = ime_dict::candidate_sort_mode::frequency; // 默认按词频排序
-    m_uiFontPercent = 100; // 状态栏默认 100%
+    m_bChineseMode = zime::default_settings::chinese_mode ? TRUE : FALSE;
+    m_bFullWidth = zime::default_settings::full_width ? TRUE : FALSE;
+    m_bChinesePunctuation =
+        zime::default_settings::chinese_punctuation ? TRUE : FALSE;
+    m_autoCommitFourCodeUnique =
+        zime::default_settings::auto_commit_four_code_unique;
+    m_commitFirstCandidateOnFifthCode =
+        zime::default_settings::commit_first_candidate_on_fifth_code;
+    m_showUncommonCandidates =
+        zime::default_settings::show_uncommon_candidates;
+    m_replaceDotAfterDigit = zime::default_settings::replace_dot_after_digit;
+    m_useEnglishPunctuationInChineseMode =
+        zime::default_settings::use_english_punctuation_in_chinese_mode;
+    m_disableChineseDash = zime::default_settings::disable_chinese_dash;
+    m_candidateSortMode = static_cast<ime_dict::candidate_sort_mode>(
+        zime::default_settings::candidate_sort_mode);
+    m_uiFontPercent = static_cast<int>(
+        zime::default_settings::ui_font_percent);
     m_statusWindowPositionCustomized = false;
+    m_statusWindowDesiredVisible = false;
     m_statusWindowPosX = 0;
     m_statusWindowPosY = 0;
     LoadRuntimeConfig();
@@ -546,14 +573,6 @@ text_service::text_service()
     m_inStatusMenuPopup = false;
     m_statusWindowHideSuppressedUntilTick = 0;
     
-    // 初始化词库
-    m_dictionary_ready = m_dictionary.init();
-    if (!m_dictionary_ready)
-    {
-        OutputDebugStringA("ERROR: dictionary init failed, IME activation will fail\n");
-    }
-    m_dictionary.set_show_uncommon_candidates(m_showUncommonCandidates);
-    m_dictionary.set_candidate_sort_mode(m_candidateSortMode);
 }
 
 text_service::~text_service()
@@ -592,11 +611,53 @@ STDAPI text_service::QueryInterface(REFIID riid, void **ppvObj)
     {
         *ppvObj = static_cast<ITfTextLayoutSink *>(this);
     }
+    else if (IsEqualIID(riid, IID_ITfFunctionProvider))
+    {
+        *ppvObj = static_cast<ITfFunctionProvider*>(this);
+    }
+    else if (IsEqualIID(riid, IID_ITfCompartmentEventSink))
+    {
+        *ppvObj = static_cast<ITfCompartmentEventSink*>(this);
+    }
 
     if (*ppvObj)
     {
         AddRef();
         return S_OK;
+    }
+
+    return E_NOINTERFACE;
+}
+
+STDMETHODIMP text_service::GetType(GUID* pguid)
+{
+    if (!pguid)
+        return E_INVALIDARG;
+    *pguid = c_clsidTextService;
+    return S_OK;
+}
+
+STDMETHODIMP text_service::GetDescription(BSTR* pbstrDesc)
+{
+    if (!pbstrDesc)
+        return E_INVALIDARG;
+    *pbstrDesc = SysAllocString(IME_DESCRIPTION);
+    return *pbstrDesc ? S_OK : E_OUTOFMEMORY;
+}
+
+STDMETHODIMP text_service::GetFunction(REFGUID rguid, REFIID riid, IUnknown** ppunk)
+{
+    if (!ppunk)
+        return E_INVALIDARG;
+    *ppunk = nullptr;
+
+    if (IsEqualGUID(rguid, GUID_NULL) &&
+        IsEqualIID(riid, IID_ITfFnSearchCandidateProvider) &&
+        m_searchCandidateProvider)
+    {
+        const HRESULT hr = m_searchCandidateProvider->QueryInterface(riid, reinterpret_cast<void**>(ppunk));
+        ime_tracef(L"FunctionProviderGet", L"search hr=0x%08lx", static_cast<unsigned long>(hr));
+        return hr;
     }
 
     return E_NOINTERFACE;
@@ -629,29 +690,83 @@ STDAPI text_service::ActivateEx(ITfThreadMgr *pThreadMgr, TfClientId tfClientId,
 
 HRESULT text_service::ActivateInternal(ITfThreadMgr *pThreadMgr, TfClientId tfClientId, DWORD dwFlags)
 {
-    // 某些宿主（尤其系统壳层/沉浸式文本框）可能无法访问外部词库文件。
-    // 不应因此导致 TIP 激活失败；缺词库时退化为“仅组合/直出”。
-    if (!m_dictionary_ready)
-    {
-        m_dictionary_ready = m_dictionary.init();
-        if (m_dictionary_ready)
-        {
-            m_dictionary.set_show_uncommon_candidates(m_showUncommonCandidates);
-            m_dictionary.set_candidate_sort_mode(m_candidateSortMode);
-        }
-    }
-
     m_pThreadMgr = pThreadMgr;
     m_pThreadMgr->AddRef();
     m_tfClientId = tfClientId;
     m_hostWantsCandidateWindow = true;
     m_uiElementOnlyMode = (dwFlags & TF_TMAE_UIELEMENTENABLEDONLY) != 0;
     m_immersiveMode = (dwFlags & TF_TMF_IMMERSIVEMODE) != 0;
+    ime_tracef(L"ActivateEx",
+               L"flags=0x%08lx uielement_only=%d immersive=%d",
+               static_cast<unsigned long>(dwFlags),
+               m_uiElementOnlyMode ? 1 : 0,
+               m_immersiveMode ? 1 : 0);
     reset_shift_track(m_bShiftPressed, m_bOtherKeyPressed);
     m_bShiftPressedWithModifier = false;
     SyncPunctuationModeWithLanguageMode();
 
     InitThreadMgrEventSink();
+    const bool functionProviderReady = !!InitFunctionProviderSink();
+    const bool inputModeReady = !!InitInputModeCompartment();
+    (void)functionProviderReady;
+    (void)inputModeReady;
+
+    SyncInputModeCompartment();
+    m_brokerClient.SetCallbacks(
+        [this](zime::broker_protocol::ui_action_type action,
+               std::uint32_t value,
+               POINT point)
+        {
+            this->OnBrokerUiAction(action, value, point);
+        },
+        [this](bool connected)
+        {
+            this->OnBrokerConnectionChanged(connected);
+        });
+    m_brokerClient.SetStorageResultCallback(
+        [this](zime::broker_protocol::storage_operation operation,
+               std::uint64_t request_id,
+               bool success,
+               const std::wstring& error)
+        {
+            this->OnBrokerStorageResult(
+                operation, request_id, success, error);
+        });
+    m_brokerClient.SetConfigStateCallback(
+        [this](const zime::broker_protocol::config_state& state)
+        {
+            this->OnBrokerConfigState(state);
+        });
+    m_brokerClient.SetCandidateResultCallback(
+        [this](std::uint64_t generation,
+               const std::wstring& code,
+               const std::vector<std::wstring>& candidates,
+               const std::vector<std::wstring>& view_texts,
+               const std::vector<bool>& pinyin_flags,
+               std::uint32_t result_flags,
+               std::uint64_t config_revision)
+        {
+            this->OnBrokerCandidateResult(generation,
+                                          code,
+                                          candidates,
+                                          view_texts,
+                                          pinyin_flags,
+                                          result_flags,
+                                          config_revision);
+        });
+    m_brokerClient.SetDictionaryStateCallback(
+        [this](std::uint64_t revision)
+        {
+            ime_tracef(L"BrokerDictionaryState",
+                       L"revision=%llu",
+                       static_cast<unsigned long long>(revision));
+            if (this->m_bInComposition &&
+                !this->m_compositionText.empty())
+            {
+                this->RequestBrokerCandidates();
+            }
+        });
+    m_brokerClient.Start();
     RefreshTextLayoutSinkForCurrentFocus();
 
     // 始终尝试挂接按键 sink。部分系统文本框会返回失败，但仍可完成 profile 激活；
@@ -667,6 +782,10 @@ HRESULT text_service::ActivateInternal(ITfThreadMgr *pThreadMgr, TfClientId tfCl
 
 STDAPI text_service::Deactivate()
 {
+    ime_tracef(L"Deactivate", L"begin");
+    m_brokerClient.Stop();
+    m_pendingCreateWordRequest = 0;
+    m_pendingCandidateStorageRequests.clear();
     UnadviseTextLayoutSink();
 
     // 清理输入状态和候选窗口
@@ -696,6 +815,9 @@ STDAPI text_service::Deactivate()
         m_candidateUIElement = nullptr;
     }
     m_candidateUIElementId = TF_INVALID_UIELEMENTID;
+
+    UninitInputModeCompartment();
+    UninitFunctionProviderSink();
     
     UninitKeyEventSink();
     UninitThreadMgrEventSink();
@@ -707,6 +829,9 @@ STDAPI text_service::Deactivate()
     }
 
     m_tfClientId = TF_CLIENTID_NULL;
+
+    ime_tracef(L"Deactivate", L"complete");
+    ZIME_PERF_FLUSH(L"ime");
 
     return S_OK;
 }
@@ -781,6 +906,268 @@ void text_service::UninitKeyEventSink()
     {
         pKeystrokeMgr->UnadviseKeyEventSink(m_tfClientId);
         pKeystrokeMgr->Release();
+    }
+}
+
+BOOL text_service::InitFunctionProviderSink()
+{
+    if (!m_pThreadMgr)
+        return FALSE;
+    if (m_functionProviderAdvised && m_searchCandidateProvider)
+        return TRUE;
+
+    auto* provider = new (std::nothrow) search_candidate_provider(this);
+    if (!provider)
+        return FALSE;
+
+    ITfSourceSingle* source = nullptr;
+    HRESULT hr = m_pThreadMgr->QueryInterface(IID_ITfSourceSingle,
+                                               reinterpret_cast<void**>(&source));
+    if (SUCCEEDED(hr) && source)
+    {
+        IUnknown* identity = nullptr;
+        hr = QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&identity));
+        if (SUCCEEDED(hr) && identity)
+        {
+            hr = source->AdviseSingleSink(m_tfClientId, IID_ITfFunctionProvider, identity);
+            identity->Release();
+        }
+        source->Release();
+    }
+
+    if (FAILED(hr))
+    {
+        provider->Release();
+        ime_tracef(L"FunctionProviderAdvise", L"hr=0x%08lx", static_cast<unsigned long>(hr));
+        return FALSE;
+    }
+
+    m_searchCandidateProvider = provider;
+    m_functionProviderAdvised = true;
+    ime_tracef(L"FunctionProviderAdvise", L"hr=0x%08lx", static_cast<unsigned long>(hr));
+    return TRUE;
+}
+
+void text_service::UninitFunctionProviderSink()
+{
+    if (m_functionProviderAdvised && m_pThreadMgr)
+    {
+        ITfSourceSingle* source = nullptr;
+        if (SUCCEEDED(m_pThreadMgr->QueryInterface(IID_ITfSourceSingle,
+                                                   reinterpret_cast<void**>(&source))) && source)
+        {
+            const HRESULT hr = source->UnadviseSingleSink(m_tfClientId, IID_ITfFunctionProvider);
+            ime_tracef(L"FunctionProviderUnadvise", L"hr=0x%08lx", static_cast<unsigned long>(hr));
+            source->Release();
+        }
+    }
+    m_functionProviderAdvised = false;
+    if (m_searchCandidateProvider)
+    {
+        m_searchCandidateProvider->Release();
+        m_searchCandidateProvider = nullptr;
+    }
+}
+
+BOOL text_service::InitInputModeCompartment()
+{
+    if (!m_pThreadMgr)
+        return FALSE;
+    if (m_inputModeCompartment)
+        return TRUE;
+
+    ITfCompartmentMgr* manager = nullptr;
+    HRESULT hr = m_pThreadMgr->QueryInterface(IID_ITfCompartmentMgr,
+                                               reinterpret_cast<void**>(&manager));
+    if (SUCCEEDED(hr) && manager)
+    {
+        hr = manager->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+                                     &m_inputModeCompartment);
+        manager->Release();
+    }
+
+    if (FAILED(hr) || !m_inputModeCompartment)
+    {
+        ime_tracef(L"InputModeCompartment", L"get hr=0x%08lx", static_cast<unsigned long>(hr));
+        return FALSE;
+    }
+
+    ITfSource* source = nullptr;
+    hr = m_inputModeCompartment->QueryInterface(IID_ITfSource,
+                                                 reinterpret_cast<void**>(&source));
+    if (SUCCEEDED(hr) && source)
+    {
+        hr = source->AdviseSink(IID_ITfCompartmentEventSink,
+                                static_cast<ITfCompartmentEventSink*>(this),
+                                &m_inputModeCompartmentSinkCookie);
+        source->Release();
+    }
+    ime_tracef(L"InputModeCompartment", L"advise hr=0x%08lx", static_cast<unsigned long>(hr));
+    return SUCCEEDED(hr);
+}
+
+void text_service::UninitInputModeCompartment()
+{
+    if (m_inputModeCompartment && m_inputModeCompartmentSinkCookie != TF_INVALID_COOKIE)
+    {
+        ITfSource* source = nullptr;
+        if (SUCCEEDED(m_inputModeCompartment->QueryInterface(IID_ITfSource,
+                                                              reinterpret_cast<void**>(&source))) && source)
+        {
+            source->UnadviseSink(m_inputModeCompartmentSinkCookie);
+            source->Release();
+        }
+    }
+    m_inputModeCompartmentSinkCookie = TF_INVALID_COOKIE;
+    if (m_inputModeCompartment)
+    {
+        m_inputModeCompartment->Release();
+        m_inputModeCompartment = nullptr;
+    }
+}
+
+void text_service::SyncInputModeCompartment()
+{
+    if (m_updatingInputModeCompartment)
+        return;
+
+    if (m_inputModeCompartment && m_tfClientId != TF_CLIENTID_NULL)
+    {
+        VARIANT current = {};
+        const HRESULT get_hr = m_inputModeCompartment->GetValue(&current);
+        const LONG expected = m_bChineseMode ? 1 : 0;
+        const bool already_set = SUCCEEDED(get_hr) && current.vt == VT_I4 && current.lVal == expected;
+        VariantClear(&current);
+        if (!already_set)
+        {
+            VARIANT value = {};
+            value.vt = VT_I4;
+            value.lVal = expected;
+            m_updatingInputModeCompartment = true;
+            const HRESULT set_hr = m_inputModeCompartment->SetValue(m_tfClientId, &value);
+            m_updatingInputModeCompartment = false;
+            ime_tracef(L"InputModeSet", L"mode=%ld hr=0x%08lx", expected, static_cast<unsigned long>(set_hr));
+        }
+    }
+
+}
+
+STDMETHODIMP text_service::OnChange(REFGUID rguid)
+{
+    if (!IsEqualGUID(rguid, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) ||
+        !m_inputModeCompartment ||
+        m_updatingInputModeCompartment)
+    {
+        return S_OK;
+    }
+
+    VARIANT value = {};
+    const HRESULT hr = m_inputModeCompartment->GetValue(&value);
+    if (SUCCEEDED(hr) && value.vt == VT_I4)
+    {
+        const BOOL next_mode = value.lVal != 0 ? TRUE : FALSE;
+        if (next_mode != m_bChineseMode)
+        {
+            if (!next_mode)
+                CommitCompositionCodeAndClear(nullptr);
+            m_updatingInputModeCompartment = true;
+            m_bChineseMode = next_mode;
+            SyncPunctuationModeWithLanguageMode();
+            m_updatingInputModeCompartment = false;
+            UpdateStatusWindow();
+            ime_tracef(L"InputModeChanged", L"mode=%d", m_bChineseMode ? 1 : 0);
+        }
+    }
+    VariantClear(&value);
+    return S_OK;
+}
+
+void text_service::SendBrokerContextSnapshot(HWND view_hwnd)
+{
+    m_brokerViewHwnd = view_hwnd;
+    m_brokerClient.SendContextSnapshot(view_hwnd);
+}
+
+void text_service::RefreshBrokerContextForCurrentFocus()
+{
+    if (!m_pThreadMgr)
+        return;
+    ITfDocumentMgr* document_manager = nullptr;
+    ITfContext* context = nullptr;
+    ITfContextView* view = nullptr;
+    HWND view_hwnd = nullptr;
+    if (SUCCEEDED(m_pThreadMgr->GetFocus(&document_manager)) && document_manager)
+    {
+        document_manager->GetTop(&context);
+        document_manager->Release();
+    }
+    if (context)
+    {
+        if (SUCCEEDED(context->GetActiveView(&view)) && view)
+        {
+            view->GetWnd(&view_hwnd);
+            view->Release();
+        }
+        context->Release();
+    }
+    if (view_hwnd)
+        SendBrokerContextSnapshot(view_hwnd);
+}
+
+HRESULT text_service::BuildSearchCandidates(BSTR query, std::vector<std::wstring>& candidates)
+{
+    candidates.clear();
+    if (!query)
+        return E_INVALIDARG;
+
+    const UINT query_length = SysStringLen(query);
+    if (query_length == 0)
+        return S_OK;
+    if (query_length > 64)
+        return E_INVALIDARG;
+    try
+    {
+        std::vector<std::wstring> all_candidates;
+        std::vector<std::wstring> view_texts;
+        std::vector<bool> pinyin_flags;
+        if (!m_brokerClient.QueryCandidatesSync(
+                std::wstring(query, query_length),
+                &all_candidates,
+                &view_texts,
+                &pinyin_flags))
+        {
+            return S_OK;
+        }
+
+        constexpr size_t kMaximumSearchCandidates = 16;
+        for (size_t i = 0; i < all_candidates.size(); ++i)
+        {
+            const std::wstring& candidate = all_candidates[i];
+            if (candidate.empty())
+                continue;
+
+            bool redundant = false;
+            for (const auto& accepted : candidates)
+            {
+                if (candidate == accepted ||
+                    candidate.rfind(accepted, 0) == 0 ||
+                    accepted.rfind(candidate, 0) == 0)
+                {
+                    redundant = true;
+                    break;
+                }
+            }
+            if (!redundant)
+                candidates.push_back(candidate);
+            if (candidates.size() >= kMaximumSearchCandidates)
+                break;
+        }
+        return S_OK;
+    }
+    catch (const std::bad_alloc&)
+    {
+        candidates.clear();
+        return E_OUTOFMEMORY;
     }
 }
 
@@ -903,7 +1290,11 @@ STDAPI text_service::OnSetFocus(ITfDocumentMgr *pDocMgrFocus, ITfDocumentMgr *pD
         ClearCandidateAnchorRect();
         HideCandidates();
         if (GetTickCount() >= m_statusWindowHideSuppressedUntilTick)
+        {
+            m_statusWindowDesiredVisible = false;
             m_statusWindow.show(false);
+            SyncBrokerStatusState();
+        }
     }
     else
     {
@@ -954,7 +1345,11 @@ STDAPI text_service::OnSetFocus(BOOL fForeground)
         ClearCandidateAnchorRect();
         HideCandidates();
         if (GetTickCount() >= m_statusWindowHideSuppressedUntilTick)
+        {
+            m_statusWindowDesiredVisible = false;
             m_statusWindow.show(false);
+            SyncBrokerStatusState();
+        }
     }
     else
     {
@@ -975,6 +1370,9 @@ STDAPI text_service::OnSetFocus(BOOL fForeground)
 
 STDAPI text_service::OnLayoutChange(ITfContext* pContext, TfLayoutCode lcode, ITfContextView* pView)
 {
+    ZIME_PERF_SCOPE("tip.OnLayoutChange",
+                    static_cast<std::int64_t>(lcode),
+                    m_candidatePositionEditPending ? 1 : 0);
     UNREFERENCED_PARAMETER(pView);
 
     if (!pContext)
@@ -986,17 +1384,29 @@ STDAPI text_service::OnLayoutChange(ITfContext* pContext, TfLayoutCode lcode, IT
     if (!m_bInComposition || m_compositionText.empty())
         return S_OK;
 
-    if (!ShouldShowOwnCandidateWindow() || !m_candidateWindow.get_hwnd())
+    if (!ShouldShowOwnCandidateWindow() &&
+        !ShouldShowBrokerCandidateWindow())
         return S_OK;
 
-    UpdateCandidateWindowPosition(pContext);
-    ApplyCandidateWindowVisibility();
+    const bool broker_owns_window =
+        m_brokerClient.IsConnected() && ShouldShowBrokerCandidateWindow();
+    if (broker_owns_window)
+    {
+        if (!m_brokerCandidateLayoutReady)
+            UpdateCandidateWindowPosition(pContext, true, true);
+    }
+    else
+    {
+        ApplyCandidateWindowVisibility();
+        UpdateCandidateWindowPosition(pContext);
+    }
     return S_OK;
 }
 
 void text_service::SyncPunctuationModeWithLanguageMode()
 {
     m_bChinesePunctuation = m_bChineseMode ? !m_useEnglishPunctuationInChineseMode : FALSE;
+    SyncInputModeCompartment();
 }
 
 

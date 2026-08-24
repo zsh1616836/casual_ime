@@ -1,0 +1,67 @@
+{
+  "manifest_version": 1,
+  "base_dictionary": {
+    "path": "dict.idx",
+    "size": 6533277,
+    "sha256": "0449290459a0333ab38a2262f4403e5c03b4e3d60bad4bd21cbfad95b8dff27d"
+  },
+  "installer_icon": {
+    "path": "packaging/zime.ico",
+    "source": "assets/status-icons/main.png",
+    "size": 159777,
+    "sha256": "e78a59756fd9113aa511740eabddbb159bb03a19f2df2ba87e8a7cf1e6c6fcde"
+  },
+  "default_config": {
+    "path": "packaging/default-config.ini",
+    "size": 300,
+    "sha256": "e7e240d15a87dd5e42c87c9757b3e9b67a6963fc713e382b3d4ac57877f7c6d7"
+  },
+  "runtime_icons": [
+    {
+      "path": "assets/status-icons/main.png",
+      "size": 415557,
+      "sha256": "ef5ed889854c8d68ba19da87f6e4139335ead77e42caec9ae7aa499c55fe4860"
+    },
+    {
+      "path": "assets/status-icons/full_width.png",
+      "size": 340903,
+      "sha256": "b96ea3abaa0d901c30328843dfd9a7705f19ffb951c042b104bf0a2bc133d7aa"
+    },
+    {
+      "path": "assets/status-icons/half_width.png",
+      "size": 178261,
+      "sha256": "0288cbdda7230957ef8c32ef9f3093aced1d173121b2cfc7c1cde66a03c50a4f"
+    },
+    {
+      "path": "assets/status-icons/cn.png",
+      "size": 329546,
+      "sha256": "ad1b0988200d8cc180630f35c2b453ff140ac4ddc895e1b53fe55f628bb0119c"
+    },
+    {
+      "path": "assets/status-icons/en.png",
+      "size": 253051,
+      "sha256": "e1b440e4b784cc00694198e87158cd6fb6c204c06bd9f64c1ee61fb785410577"
+    },
+    {
+      "path": "assets/status-icons/cn_pun.png",
+      "size": 100114,
+      "sha256": "856f2e9e8894d3d05601f5e7817ad138390004ee3f304b391b4aa8edd82d1507"
+    },
+    {
+      "path": "assets/status-icons/en_pun.png",
+      "size": 45989,
+      "sha256": "7d8984149f3436f8b161a913f0d80385b78d13a395ea9301d507e7576a3ac5d9"
+    },
+    {
+      "path": "assets/status-icons/settings.png",
+      "size": 495477,
+      "sha256": "7589a4810e8a486a5fa14b23af178db7db0f42bd1d4a0d017804921d33219f3a"
+    }
+  ],
+  "non_runtime_icons": [
+    "ico/ch.png",
+    "ico/full_wdith.png",
+    "ico/main1.png",
+    "ico/main2.png"
+  ]
+}
