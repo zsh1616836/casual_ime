@@ -1845,7 +1845,12 @@ void text_service::ShowStatusWindow()
         return;
     }
 
-    const HWND owner = get_foreground_ui_owner_window();
+    HWND owner = get_foreground_ui_owner_window();
+    // During language switching, the foreground window can belong to a system
+    // UI thread. Match status_window::create's ownership rule before comparing
+    // owners, otherwise every update would unnecessarily recreate the window.
+    if (owner && GetWindowThreadProcessId(owner, nullptr) != GetCurrentThreadId())
+        owner = nullptr;
     ime_tracef(L"StatusWindow",
                L"route=local visible=1 owner=0x%p owner_pid=%lu",
                owner,

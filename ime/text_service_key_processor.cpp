@@ -1,6 +1,7 @@
 ﻿#include "text_service.h"
 
 #include <Windows.h>
+#include "ime_trace.h"
 #include "perf_trace.h"
 #include <map>
 #include <cwctype>
@@ -78,6 +79,15 @@ STDAPI text_service::OnTestKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM l
     BYTE keyState[256] = {};
     GetKeyboardState(keyState);
     const bool systemModifierPressed = has_system_modifier(keyState);
+
+    // State only: never log the letter/digit, composition or candidate text.
+    ime_tracef(L"KeyTestDown",
+               L"context=%p chinese=%d shift_key=%d ctrl=%d alt=%d win=%d caps=%d",
+               pContext, m_bChineseMode, is_shift_vk(wParam) ? 1 : 0,
+               (keyState[VK_CONTROL] & 0x80) ? 1 : 0,
+               (keyState[VK_MENU] & 0x80) ? 1 : 0,
+               ((keyState[VK_LWIN] | keyState[VK_RWIN]) & 0x80) ? 1 : 0,
+               keyState[VK_CAPITAL] & 1);
 
     if (is_shift_vk(wParam))
     {
@@ -179,6 +189,7 @@ STDAPI text_service::OnTestKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM l
 
 STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
+    ime_tracef(L"KeyDown", L"context=%p chinese=%d", pContext, m_bChineseMode);
     ZIME_PERF_SCOPE("tip.OnKeyDown",
                     static_cast<std::int64_t>(m_compositionText.size()),
                     m_bInComposition ? 1 : 0);
@@ -606,6 +617,10 @@ STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lPara
 
 STDAPI text_service::OnTestKeyUp(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
+    ime_tracef(L"KeyTestUp",
+               L"shift_key=%d tracked=%d other=%d with_modifier=%d",
+               is_shift_vk(wParam) ? 1 : 0, m_bShiftPressed ? 1 : 0,
+               m_bOtherKeyPressed ? 1 : 0, m_bShiftPressedWithModifier ? 1 : 0);
     *pfEaten = FALSE;
 
     // 某些终端/宿主下可能不稳定触发 OnKeyUp，故在 OnTestKeyUp 提前执行一次切换。

@@ -194,6 +194,7 @@ bool try_get_visible_window_anchor(HWND view, HWND owner, RECT* anchor)
 broker_ui_controller::broker_ui_controller()
     : instance_(nullptr),
       storage_(nullptr),
+      global_config_{},
       controller_window_(nullptr),
       active_connection_id_(0),
       active_generation_(0),
@@ -604,7 +605,7 @@ void broker_ui_controller::ApplyStatusUpdate(
     active_status_connection_id_ = update->connection_id;
     active_status_generation_ = update->generation;
     active_status_sender_ = std::move(update->send_action);
-    EnsureStatusWindow(update->owner_hwnd);
+    EnsureStatusWindow();
     if (!status_window_.get_hwnd())
     {
         broker_error_log(L"status create failed owner=0x%p error=%lu",
@@ -796,17 +797,16 @@ void broker_ui_controller::ShowCandidateContextMenu(
     }
 }
 
-void broker_ui_controller::EnsureStatusWindow(HWND owner)
+void broker_ui_controller::EnsureStatusWindow()
 {
-    HWND status = status_window_.get_hwnd();
-    if (status && GetWindow(status, GW_OWNER) != owner)
-    {
-        status_window_.destroy();
-        status = nullptr;
-    }
-    if (status)
+    if (status_window_.get_hwnd())
         return;
-    if (!status_window_.create(owner))
+    // A cross-thread owner implicitly attaches the two input queues, even with
+    // WS_EX_NOACTIVATE. Creating/destroying that relationship during a language
+    // hotkey can interfere with the host's focus and key delivery. As with the
+    // candidate window, use the client HWND only for validation and positioning;
+    // visibility/lifetime are controlled by status updates and connection close.
+    if (!status_window_.create(nullptr))
         return;
 
     status_window_.set_status_change_callback(

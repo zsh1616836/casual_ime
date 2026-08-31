@@ -96,7 +96,7 @@ private:
                              std::uint32_t value,
                              POINT screen_point = {});
     void ShowCandidateContextMenu(int candidate_index, POINT screen_point);
-    void EnsureStatusWindow(HWND owner);
+    void EnsureStatusWindow();
     void SendStatusChange(int status_type);
     void CommitGlobalStatusChange(int status_type);
     void CommitStatusPosition(int x, int y);

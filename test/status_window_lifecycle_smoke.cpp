@@ -97,6 +97,8 @@ int wmain(int argc, wchar_t** argv)
 
     CloseHandle(process.hThread);
     const DWORD wait_result = WaitForSingleObject(process.hProcess, 5000);
+    DWORD exit_code = 0;
+    const BOOL got_exit_code = GetExitCodeProcess(process.hProcess, &exit_code);
     if (wait_result == WAIT_TIMEOUT)
         TerminateProcess(process.hProcess, 100);
     CloseHandle(process.hProcess);
@@ -106,6 +108,12 @@ int wmain(int argc, wchar_t** argv)
         std::wcerr << L"status window held process after destruction"
                    << std::endl;
         return 5;
+    }
+    if (!got_exit_code || exit_code != 0)
+    {
+        std::wcerr << L"status window lifecycle child failed: " << exit_code
+                   << std::endl;
+        return 6;
     }
     std::wcout << L"status window lifecycle passed" << std::endl;
     return 0;

@@ -248,6 +248,13 @@ void status_window::register_window_class()
 
 BOOL status_window::create(HWND hWndParent)
 {
+    // Never join a host/foreign UI thread's input queue through popup ownership.
+    // Local fallback windows may retain an owner on their own TSF thread.
+    if (hWndParent &&
+        GetWindowThreadProcessId(hWndParent, nullptr) != GetCurrentThreadId())
+    {
+        hWndParent = nullptr;
+    }
     if (!graphics_)
         graphics_ = std::make_unique<status_window_graphics>();
     register_window_class();
