@@ -83,3 +83,11 @@ target_link_libraries(broker_status_focus_smoke PRIVATE
 )
 set_property(TARGET broker_status_focus_smoke PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+add_executable(input_policy_smoke input_policy_smoke.cpp)
+target_include_directories(input_policy_smoke PRIVATE
+    ${CMAKE_SOURCE_DIR}/common
+    ${CMAKE_SOURCE_DIR}/ime
+)
+set_property(TARGET input_policy_smoke PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

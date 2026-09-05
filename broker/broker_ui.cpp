@@ -2,6 +2,7 @@
 
 #include "broker_log.h"
 #include "broker_storage.h"
+#include "candidate_code.h"
 
 #include <algorithm>
 #include <commdlg.h>
@@ -199,6 +200,7 @@ broker_ui_controller::broker_ui_controller()
       active_connection_id_(0),
       active_generation_(0),
       active_query_generation_(0),
+      candidate_mutation_request_id_(0),
       active_anchor_{},
       active_anchor_valid_(false),
       active_status_connection_id_(0),
@@ -454,7 +456,8 @@ void broker_ui_controller::ApplyCandidateUpdate(
         if (active_query_generation_ < cached->second.query_generation)
         {
             active_query_generation_ = cached->second.query_generation;
-            candidate_window_.set_candidates(cached->second.candidates);
+            candidate_window_.set_candidates(cached->second.candidates,
+                                             cached->second.view_texts);
         }
     }
     else
@@ -541,7 +544,7 @@ void broker_ui_controller::ApplyCandidateResult(
     }
 
     active_query_generation_ = result.query_generation;
-    candidate_window_.set_candidates(result.candidates);
+    candidate_window_.set_candidates(result.candidates, result.view_texts);
     candidate_window_.set_selection(0);
     if (active_anchor_valid_)
         PositionCandidateWindow(active_anchor_);
@@ -759,6 +762,14 @@ void broker_ui_controller::ShowCandidateContextMenu(
     int candidate_index,
     POINT screen_point)
 {
+    // Keep the exact candidate that the user opened the menu for. The TIP may
+    // receive a transient focus callback while the out-of-process menu is up,
+    // so the mutation must not depend on its live composition state later.
+    const std::wstring code_snapshot = active_composition_;
+    const std::wstring candidate_snapshot =
+        candidate_window_.get_candidate(candidate_index);
+    const std::wstring display_snapshot =
+        candidate_window_.get_display_candidate(candidate_index);
     HMENU menu = CreatePopupMenu();
     if (!menu)
         return;
@@ -767,6 +778,10 @@ void broker_ui_controller::ShowCandidateContextMenu(
                 MF_STRING,
                 ID_CANDIDATE_MARK_UNCOMMON,
                 L"\u6807\u8bb0\u4e0d\u5e38\u7528");
+    SendCandidateAction(
+        zime::broker_protocol::ui_action_type::candidate_menu_popup,
+        1,
+        screen_point);
     const UINT command = TrackPopupMenu(
         menu,
         TPM_RETURNCMD |
@@ -781,20 +796,42 @@ void broker_ui_controller::ShowCandidateContextMenu(
         nullptr);
     DestroyMenu(menu);
 
-    if (command == ID_CANDIDATE_DELETE)
+    if (command == ID_CANDIDATE_DELETE ||
+        command == ID_CANDIDATE_MARK_UNCOMMON)
     {
-        SendCandidateAction(
-            zime::broker_protocol::ui_action_type::candidate_delete,
-            static_cast<std::uint32_t>(candidate_index),
-            screen_point);
+        const auto operation = command == ID_CANDIDATE_DELETE
+            ? zime::broker_protocol::storage_operation::delete_candidate
+            : zime::broker_protocol::storage_operation::mark_uncommon;
+        const std::wstring effective_code = zime::resolve_candidate_code(
+            code_snapshot, candidate_snapshot, display_snapshot);
+        std::wstring error;
+        const bool success = storage_ && !effective_code.empty() &&
+            !candidate_snapshot.empty() && storage_->ApplyMutation(
+                0x42524f4b4552434eull,
+                ++candidate_mutation_request_id_,
+                operation,
+                effective_code,
+                candidate_snapshot,
+                &error);
+        if (success)
+        {
+            if (dictionary_committed_)
+                dictionary_committed_(storage_->DictionaryRevision());
+        }
+        else
+        {
+            MessageBoxW(candidate_window_.get_hwnd(),
+                        error.empty()
+                            ? L"\u66f4\u65b0\u5019\u9009\u5931\u8d25\u3002"
+                            : error.c_str(),
+                        L"ZIme",
+                        MB_OK | MB_ICONERROR);
+        }
     }
-    else if (command == ID_CANDIDATE_MARK_UNCOMMON)
-    {
-        SendCandidateAction(
-            zime::broker_protocol::ui_action_type::candidate_mark_uncommon,
-            static_cast<std::uint32_t>(candidate_index),
-            screen_point);
-    }
+    SendCandidateAction(
+        zime::broker_protocol::ui_action_type::candidate_menu_popup,
+        0,
+        screen_point);
 }
 
 void broker_ui_controller::EnsureStatusWindow()

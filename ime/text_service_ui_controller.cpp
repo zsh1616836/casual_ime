@@ -2,6 +2,8 @@
 
 #include "ime_trace.h"
 #include "perf_trace.h"
+#include "candidate_code.h"
+#include "input_policy.h"
 
 #include <Windows.h>
 #include <shellapi.h>
@@ -554,6 +556,9 @@ void text_service::OnBrokerConnectionChanged(bool connected)
     }
     else
     {
+        // A Broker crash/disconnect can lose a menu-close action.
+        m_inCandidateContextMenu = false;
+        m_inStatusMenuPopup = false;
         if (m_pendingCreateWordRequest != 0)
         {
             m_pendingCreateWordRequest = 0;
@@ -809,7 +814,10 @@ void text_service::OnBrokerCandidateResult(
         }
         else
         {
-            InsertText(context, code);
+            if (zime::input_policy::is_temporary_raw_composition(code))
+                InsertRawText(context, code);
+            else
+                InsertText(context, code);
             ClearComposition();
             HideCandidates();
         }
@@ -895,6 +903,14 @@ void text_service::OnBrokerUiAction(
         return;
     case ui_action_type::candidate_mark_uncommon:
         OnCandidateContextCommand(static_cast<int>(value), false);
+        return;
+    case ui_action_type::candidate_menu_popup:
+        m_inCandidateContextMenu = value != 0;
+        if (!m_inCandidateContextMenu &&
+            m_bInComposition && !m_compositionText.empty())
+        {
+            ApplyCandidateWindowVisibility();
+        }
         return;
     case ui_action_type::candidate_page:
     {
@@ -2271,23 +2287,8 @@ std::wstring text_service::ResolveCandidateCodeForContextMenu(const std::wstring
                                                               const std::wstring& candidate_text,
                                                               const std::wstring& display_text) const
 {
-    if (code_snapshot.empty() || candidate_text.empty() || display_text.empty())
-        return code_snapshot;
-    if (display_text.size() <= candidate_text.size())
-        return code_snapshot;
-
-    if (display_text.compare(0, candidate_text.size(), candidate_text) != 0)
-        return code_snapshot;
-
-    const std::wstring suffix = display_text.substr(candidate_text.size());
-    if (suffix.size() == 1)
-    {
-        const wchar_t ch = static_cast<wchar_t>(towlower(suffix[0]));
-        if (ch >= L'a' && ch <= L'z')
-            return code_snapshot + std::wstring(1, ch);
-    }
-
-    return code_snapshot;
+    return zime::resolve_candidate_code(
+        code_snapshot, candidate_text, display_text);
 }
 
 void text_service::RecordCandidateSelection(const std::wstring& code_snapshot,

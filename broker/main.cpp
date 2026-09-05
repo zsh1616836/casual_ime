@@ -15,6 +15,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -436,6 +437,9 @@ struct client_channel
     HANDLE pipe;
     std::uint64_t connection_id;
     std::mutex send_mutex;
+    std::mutex action_mutex;
+    std::deque<zime::broker_protocol::ui_action> action_queue;
+    bool action_sender_running = false;
     bool closed;
 
     client_channel(HANDLE pipe_handle, std::uint64_t id)
@@ -585,14 +589,29 @@ void broadcast_dictionary_state(std::uint64_t revision)
 struct action_job
 {
     std::shared_ptr<client_channel> channel;
-    zime::broker_protocol::ui_action action;
 };
 
 void CALLBACK send_action_callback(PTP_CALLBACK_INSTANCE, void* context)
 {
     std::unique_ptr<action_job> job(static_cast<action_job*>(context));
-    if (job && job->channel)
-        job->channel->Send(&job->action);
+    if (!job || !job->channel)
+        return;
+
+    for (;;)
+    {
+        zime::broker_protocol::ui_action action = {};
+        {
+            std::lock_guard<std::mutex> lock(job->channel->action_mutex);
+            if (job->channel->action_queue.empty())
+            {
+                job->channel->action_sender_running = false;
+                return;
+            }
+            action = job->channel->action_queue.front();
+            job->channel->action_queue.pop_front();
+        }
+        job->channel->Send(&action);
+    }
 }
 
 void enqueue_ui_action(const std::weak_ptr<client_channel>& weak_channel,
@@ -601,11 +620,34 @@ void enqueue_ui_action(const std::weak_ptr<client_channel>& weak_channel,
     const std::shared_ptr<client_channel> channel = weak_channel.lock();
     if (!channel)
         return;
-    auto* job = new (std::nothrow) action_job{channel, action};
-    if (!job)
+
+    bool start_sender = false;
+    {
+        std::lock_guard<std::mutex> lock(channel->action_mutex);
+        channel->action_queue.push_back(action);
+        if (!channel->action_sender_running)
+        {
+            channel->action_sender_running = true;
+            start_sender = true;
+        }
+    }
+    if (!start_sender)
         return;
+
+    auto* job = new (std::nothrow) action_job{channel};
+    if (!job)
+    {
+        std::lock_guard<std::mutex> lock(channel->action_mutex);
+        channel->action_sender_running = false;
+        channel->action_queue.clear();
+        return;
+    }
     if (!TrySubmitThreadpoolCallback(send_action_callback, job, nullptr))
-        delete job;
+    {
+        // Preserve ordering even under thread-pool pressure. UI actions are
+        // small and the pipe write has its own bounded timeout.
+        send_action_callback(nullptr, job);
+    }
 }
 
 std::unique_ptr<broker_candidate_update> decode_candidate_update(
@@ -938,7 +980,8 @@ bool process_candidate_query(
         ui_result->query_generation = request.generation;
         ui_result->result_flags = result_flags;
         ui_result->composition = code;
-        ui_result->candidates = view_texts;
+        ui_result->candidates = candidates;
+        ui_result->view_texts = view_texts;
         broker_ui_controller::PostCandidateResult(
             ui_controller, std::move(ui_result));
     }

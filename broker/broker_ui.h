@@ -42,6 +42,7 @@ struct broker_candidate_result_update
     std::uint32_t result_flags;
     std::wstring composition;
     std::vector<std::wstring> candidates;
+    std::vector<std::wstring> view_texts;
 };
 
 struct broker_status_update
@@ -120,6 +121,7 @@ private:
     std::uint64_t active_connection_id_;
     std::uint64_t active_generation_;
     std::uint64_t active_query_generation_;
+    std::uint64_t candidate_mutation_request_id_;
     std::wstring active_composition_;
     std::unordered_map<std::uint64_t, broker_candidate_result_update>
         cached_candidate_results_;
