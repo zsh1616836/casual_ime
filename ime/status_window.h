@@ -26,6 +26,7 @@ public:
     using PositionChangedCallback = std::function<void(int, int)>;
     void set_position_changed_callback(PositionChangedCallback callback) { position_changed_callback_ = callback; }
 
+    // Foreign-thread owners are ignored to keep input queues independent.
     BOOL create(HWND hWndParent);
     void destroy();
     void show(bool bShow) const;

@@ -2,6 +2,8 @@
 
 #include "ime_trace.h"
 #include "perf_trace.h"
+#include "candidate_code.h"
+#include "input_policy.h"
 
 #include <Windows.h>
 #include <shellapi.h>
@@ -554,6 +556,9 @@ void text_service::OnBrokerConnectionChanged(bool connected)
     }
     else
     {
+        // A Broker crash/disconnect can lose a menu-close action.
+        m_inCandidateContextMenu = false;
+        m_inStatusMenuPopup = false;
         if (m_pendingCreateWordRequest != 0)
         {
             m_pendingCreateWordRequest = 0;
@@ -809,7 +814,10 @@ void text_service::OnBrokerCandidateResult(
         }
         else
         {
-            InsertText(context, code);
+            if (zime::input_policy::is_temporary_raw_composition(code))
+                InsertRawText(context, code);
+            else
+                InsertText(context, code);
             ClearComposition();
             HideCandidates();
         }
@@ -895,6 +903,14 @@ void text_service::OnBrokerUiAction(
         return;
     case ui_action_type::candidate_mark_uncommon:
         OnCandidateContextCommand(static_cast<int>(value), false);
+        return;
+    case ui_action_type::candidate_menu_popup:
+        m_inCandidateContextMenu = value != 0;
+        if (!m_inCandidateContextMenu &&
+            m_bInComposition && !m_compositionText.empty())
+        {
+            ApplyCandidateWindowVisibility();
+        }
         return;
     case ui_action_type::candidate_page:
     {
@@ -990,6 +1006,22 @@ void text_service::UpdateCandidateUIElement(ITfContext *pContext)
         return;
 
     const int candidate_count = m_candidateWindow.get_candidate_count();
+
+    // HandleCharacter clears the previous candidate snapshot before starting
+    // an asynchronous Broker query.  That temporary empty state is not the end
+    // of the candidate session.  Ending the UIElement here makes shell hosts
+    // close and immediately recreate their candidate presentation for every
+    // key, which is visible as flicker.  Once the matching Broker result
+    // arrives, an empty result is handled normally because the snapshot code
+    // then matches the current composition.
+    const bool candidate_result_pending =
+        candidate_count <= 0 &&
+        m_bInComposition &&
+        !m_compositionText.empty() &&
+        m_brokerClient.IsConnected() &&
+        m_brokerCandidateCode != m_compositionText;
+    if (candidate_result_pending)
+        return;
 
     if (!m_candidateUIElement)
     {
@@ -1845,7 +1877,12 @@ void text_service::ShowStatusWindow()
         return;
     }
 
-    const HWND owner = get_foreground_ui_owner_window();
+    HWND owner = get_foreground_ui_owner_window();
+    // During language switching, the foreground window can belong to a system
+    // UI thread. Match status_window::create's ownership rule before comparing
+    // owners, otherwise every update would unnecessarily recreate the window.
+    if (owner && GetWindowThreadProcessId(owner, nullptr) != GetCurrentThreadId())
+        owner = nullptr;
     ime_tracef(L"StatusWindow",
                L"route=local visible=1 owner=0x%p owner_pid=%lu",
                owner,
@@ -2266,23 +2303,8 @@ std::wstring text_service::ResolveCandidateCodeForContextMenu(const std::wstring
                                                               const std::wstring& candidate_text,
                                                               const std::wstring& display_text) const
 {
-    if (code_snapshot.empty() || candidate_text.empty() || display_text.empty())
-        return code_snapshot;
-    if (display_text.size() <= candidate_text.size())
-        return code_snapshot;
-
-    if (display_text.compare(0, candidate_text.size(), candidate_text) != 0)
-        return code_snapshot;
-
-    const std::wstring suffix = display_text.substr(candidate_text.size());
-    if (suffix.size() == 1)
-    {
-        const wchar_t ch = static_cast<wchar_t>(towlower(suffix[0]));
-        if (ch >= L'a' && ch <= L'z')
-            return code_snapshot + std::wstring(1, ch);
-    }
-
-    return code_snapshot;
+    return zime::resolve_candidate_code(
+        code_snapshot, candidate_text, display_text);
 }
 
 void text_service::RecordCandidateSelection(const std::wstring& code_snapshot,

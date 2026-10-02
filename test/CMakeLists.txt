@@ -57,3 +57,37 @@ set_property(TARGET status_window_lifecycle_smoke PROPERTY
 add_executable(window_lifecycle_probe window_lifecycle_probe.cpp)
 set_property(TARGET window_lifecycle_probe PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+# Exercises the real UI controller without a pipe server or initialized storage.
+add_executable(broker_status_focus_smoke
+    broker_status_focus_smoke.cpp
+    ${CMAKE_SOURCE_DIR}/broker/broker_ui.cpp
+    ${CMAKE_SOURCE_DIR}/broker/broker_log.cpp
+    ${CMAKE_SOURCE_DIR}/broker/broker_storage.cpp
+    ${CMAKE_SOURCE_DIR}/common/perf_trace.cpp
+    ${CMAKE_SOURCE_DIR}/ime/candidate_form.cpp
+    ${CMAKE_SOURCE_DIR}/ime/globals.cpp
+    ${CMAKE_SOURCE_DIR}/ime/status_window.cpp
+    ${CMAKE_SOURCE_DIR}/ime/tool.cpp
+    ${CMAKE_SOURCE_DIR}/ime/ime_dictionary.cpp
+    ${CMAKE_SOURCE_DIR}/ime/3rd/sqlite_tool.cpp
+    ${CMAKE_SOURCE_DIR}/ime/3rd/sqlite3.c
+)
+target_include_directories(broker_status_focus_smoke PRIVATE
+    ${CMAKE_SOURCE_DIR}/broker
+    ${CMAKE_SOURCE_DIR}/common
+    ${CMAKE_SOURCE_DIR}/ime
+)
+target_link_libraries(broker_status_focus_smoke PRIVATE
+    advapi32 bcrypt gdi32 gdiplus comctl32 comdlg32 shell32 user32
+)
+set_property(TARGET broker_status_focus_smoke PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+add_executable(input_policy_smoke input_policy_smoke.cpp)
+target_include_directories(input_policy_smoke PRIVATE
+    ${CMAKE_SOURCE_DIR}/common
+    ${CMAKE_SOURCE_DIR}/ime
+)
+set_property(TARGET input_policy_smoke PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

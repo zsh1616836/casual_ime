@@ -14,7 +14,7 @@
 // ============================================================
 #define IME_NAME            L"随意五笔输入法"
 #define IME_DESCRIPTION     L"随意五笔输入法"
-#define IME_VERSION         L"1.0"
+#define IME_VERSION         L"1.1"
 #define IME_AUTHOR          L""
 
 // ============================================================

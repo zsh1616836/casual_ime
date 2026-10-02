@@ -1345,15 +1345,12 @@ bool broker_client::ProcessIncoming(const std::uint8_t* bytes, std::size_t size)
             return false;
         }
         const auto& action = *reinterpret_cast<const ui_action*>(bytes);
-        const bool candidate_action =
-            action.action == ui_action_type::candidate_select ||
-            action.action == ui_action_type::candidate_page ||
-            action.action == ui_action_type::candidate_delete ||
-            action.action == ui_action_type::candidate_mark_uncommon;
+        const bool candidate_action = is_candidate_ui_action(action.action);
         const std::uint64_t expected_generation = candidate_action
             ? latest_candidate_generation_.load()
             : latest_status_generation_.load();
-        if (action.generation != expected_generation)
+        if (action.action != ui_action_type::candidate_menu_popup &&
+            action.generation != expected_generation)
             return true;
         PostAction(action);
         return true;
@@ -1929,18 +1926,14 @@ LRESULT CALLBACK broker_client::CallbackWindowProc(
             else if (client->action_callback_)
             {
                 const bool candidate_action =
-                    callback->action.action ==
-                        zime::broker_protocol::ui_action_type::candidate_select ||
-                    callback->action.action ==
-                        zime::broker_protocol::ui_action_type::candidate_page ||
-                    callback->action.action ==
-                        zime::broker_protocol::ui_action_type::candidate_delete ||
-                    callback->action.action ==
-                        zime::broker_protocol::ui_action_type::candidate_mark_uncommon;
+                    zime::broker_protocol::is_candidate_ui_action(
+                        callback->action.action);
                 const std::uint64_t expected_generation = candidate_action
                     ? client->latest_candidate_generation_.load()
                     : client->latest_status_generation_.load();
-                if (callback->action.generation == expected_generation)
+                if (callback->action.action ==
+                        zime::broker_protocol::ui_action_type::candidate_menu_popup ||
+                    callback->action.generation == expected_generation)
                 {
                     POINT point = {callback->action.screen_x,
                                    callback->action.screen_y};

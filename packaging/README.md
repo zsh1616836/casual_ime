@@ -1,5 +1,26 @@
 # casual_ime Installer
 
+## Double-click build
+
+Double-click `build-installer.bat` in the repository root, then enter a version
+such as `1.1` or `1.1.2`. The Python entry point synchronizes `IME_VERSION` and
+`packaging/version.txt`, configures the x64/x86 Visual Studio build directories,
+and runs the existing build and packaging pipeline. The console stays open to
+show the result. Outputs are `dist/casual_ime-<version>-x64.exe`, `.sha256`, and
+`.build.json`; the installer includes both x64 and x86 IME DLLs.
+
+Requirements: Windows, Python 3.8+, CMake 3.23+, Git, Visual Studio with the
+Desktop development with C++ workload and Windows SDK, and Inno Setup 7.
+No Python packages need to be installed. `ISCC` can specify the full path to
+`ISCC.exe`. A repeated version replaces that version's output package. The
+requested version stays in the source files if compilation fails.
+
+For command-line use:
+
+```powershell
+python packaging/build_installer.py --version 1.1.2
+```
+
 `build-installer.ps1` builds the existing x64 and x86 CMake trees, validates
 the frozen dictionary and runtime icons, stages the release files, and invokes
 Inno Setup 7 to create one x64 installer.

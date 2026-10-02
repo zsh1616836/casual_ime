@@ -772,6 +772,8 @@ HRESULT text_service::ActivateInternal(ITfThreadMgr *pThreadMgr, TfClientId tfCl
     // 始终尝试挂接按键 sink。部分系统文本框会返回失败，但仍可完成 profile 激活；
     // 这里不再因为挂接失败而中断 Activate，避免出现“无法切换到该输入法”。
     const bool keySinkReady = !!InitKeyEventSink();
+    ime_tracef(L"ActivateKeySink", L"ready=%d client=%lu",
+               keySinkReady ? 1 : 0, static_cast<unsigned long>(m_tfClientId));
     (void)keySinkReady;
 
     if (ShouldShowStatusWindow())
@@ -888,12 +890,24 @@ BOOL text_service::InitKeyEventSink()
                                                TRUE);
         if (FAILED(hr))
         {
-            // 部分宿主不接受 foreground-only 订阅，回退到非 foreground 模式重试。
+            ime_errorf(L"KeyEventSink", L"stage=foreground hr=0x%08lx client=%lu",
+                       static_cast<unsigned long>(hr),
+                       static_cast<unsigned long>(m_tfClientId));
+            // Legacy fallback is retained for now. Non-foreground success does
+            // not guarantee ordinary key delivery; keep both results visible.
             hr = pKeystrokeMgr->AdviseKeyEventSink(m_tfClientId,
                                                    (ITfKeyEventSink*)this,
                                                    FALSE);
+            ime_errorf(L"KeyEventSink", L"stage=nonforeground_fallback hr=0x%08lx client=%lu",
+                       static_cast<unsigned long>(hr),
+                       static_cast<unsigned long>(m_tfClientId));
         }
         pKeystrokeMgr->Release();
+    }
+    else
+    {
+        ime_errorf(L"KeyEventSink", L"stage=query_interface hr=0x%08lx",
+                   static_cast<unsigned long>(hr));
     }
 
     return SUCCEEDED(hr);
@@ -1272,6 +1286,9 @@ STDAPI text_service::OnUninitDocumentMgr(ITfDocumentMgr *pDocMgr)
 
 STDAPI text_service::OnSetFocus(ITfDocumentMgr *pDocMgrFocus, ITfDocumentMgr *pDocMgrPrevFocus)
 {
+    ime_tracef(L"DocumentFocus", L"service=%p current=%p previous=%p menu=%d",
+               this, pDocMgrFocus, pDocMgrPrevFocus,
+               (m_inCandidateContextMenu || m_inStatusMenuPopup) ? 1 : 0);
     if (m_inCandidateContextMenu || m_inStatusMenuPopup)
     {
         return S_OK;
@@ -1327,6 +1344,9 @@ STDAPI text_service::OnPopContext(ITfContext *pContext)
 
 STDAPI text_service::OnSetFocus(BOOL fForeground)
 {
+    ime_tracef(L"KeySinkFocus", L"service=%p foreground=%d menu=%d",
+               this, fForeground,
+               (m_inCandidateContextMenu || m_inStatusMenuPopup) ? 1 : 0);
     if (m_inCandidateContextMenu || m_inStatusMenuPopup)
     {
         return S_OK;

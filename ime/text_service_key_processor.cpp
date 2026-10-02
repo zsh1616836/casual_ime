@@ -1,6 +1,8 @@
 ﻿#include "text_service.h"
 
 #include <Windows.h>
+#include "input_policy.h"
+#include "ime_trace.h"
 #include "perf_trace.h"
 #include <map>
 #include <cwctype>
@@ -62,14 +64,6 @@ std::wstring resolve_raw_symbol_text(WPARAM wParam, bool shiftPressed)
     }
 }
 
-bool is_composition_extension_symbol(WPARAM wParam, bool shiftPressed)
-{
-    return shiftPressed &&
-           ((wParam >= '0' && wParam <= '9') ||
-            wParam == VK_OEM_PLUS ||
-            wParam == VK_OEM_MINUS ||
-            wParam == VK_OEM_3);
-}
 }
 STDAPI text_service::OnTestKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
@@ -78,6 +72,15 @@ STDAPI text_service::OnTestKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM l
     BYTE keyState[256] = {};
     GetKeyboardState(keyState);
     const bool systemModifierPressed = has_system_modifier(keyState);
+
+    // State only: never log the letter/digit, composition or candidate text.
+    ime_tracef(L"KeyTestDown",
+               L"context=%p chinese=%d shift_key=%d ctrl=%d alt=%d win=%d caps=%d",
+               pContext, m_bChineseMode, is_shift_vk(wParam) ? 1 : 0,
+               (keyState[VK_CONTROL] & 0x80) ? 1 : 0,
+               (keyState[VK_MENU] & 0x80) ? 1 : 0,
+               ((keyState[VK_LWIN] | keyState[VK_RWIN]) & 0x80) ? 1 : 0,
+               keyState[VK_CAPITAL] & 1);
 
     if (is_shift_vk(wParam))
     {
@@ -152,6 +155,7 @@ STDAPI text_service::OnTestKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM l
     if (m_bChineseMode && m_bInComposition && !m_compositionText.empty())
     {
         if ((wParam >= '0' && wParam <= '9') ||
+            zime::input_policy::is_numpad_digit(wParam) ||
             wParam == VK_SPACE ||
             wParam == VK_BACK ||
             wParam == VK_ESCAPE ||
@@ -179,6 +183,7 @@ STDAPI text_service::OnTestKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM l
 
 STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
+    ime_tracef(L"KeyDown", L"context=%p chinese=%d", pContext, m_bChineseMode);
     ZIME_PERF_SCOPE("tip.OnKeyDown",
                     static_cast<std::int64_t>(m_compositionText.size()),
                     m_bInComposition ? 1 : 0);
@@ -273,9 +278,24 @@ STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lPara
     // 处理标点符号（中文标点模式）
     if (m_bInComposition && !m_compositionText.empty())
     {
-        if (is_composition_extension_symbol(wParam, shiftPressed))
+        if (zime::input_policy::is_numpad_digit(wParam))
         {
-            const std::wstring composition_symbol = resolve_raw_symbol_text(wParam, true);
+            HandleCharacter(pContext, zime::input_policy::numpad_digit(wParam));
+            *pfEaten = TRUE;
+            return S_OK;
+        }
+        if (zime::input_policy::should_append_unshifted_main_digit(
+                m_compositionText, wParam, shiftPressed))
+        {
+            HandleCharacter(pContext, static_cast<wchar_t>(wParam));
+            *pfEaten = TRUE;
+            return S_OK;
+        }
+        if (zime::input_policy::should_append_number_row_symbol(
+                m_compositionText, wParam, shiftPressed))
+        {
+            const std::wstring composition_symbol =
+                resolve_raw_symbol_text(wParam, shiftPressed);
             if (!composition_symbol.empty())
             {
                 HandleCharacter(pContext, composition_symbol[0]);
@@ -473,8 +493,17 @@ STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lPara
     {
         if (m_bInComposition && !m_compositionText.empty())
         {
-            // 直接上屏输入的编码
-            InsertText(pContext, m_compositionText);
+            // 首字母大写的临时输入保留用户键入的 ASCII；
+            // 普通编码仍遵循现有全角/标点设置。
+            if (zime::input_policy::is_temporary_raw_composition(
+                    m_compositionText))
+            {
+                InsertRawText(pContext, m_compositionText);
+            }
+            else
+            {
+                InsertText(pContext, m_compositionText);
+            }
             ClearComposition();
             HideCandidates();
             *pfEaten = TRUE;
@@ -606,6 +635,10 @@ STDAPI text_service::OnKeyDown(ITfContext *pContext, WPARAM wParam, LPARAM lPara
 
 STDAPI text_service::OnTestKeyUp(ITfContext *pContext, WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
+    ime_tracef(L"KeyTestUp",
+               L"shift_key=%d tracked=%d other=%d with_modifier=%d",
+               is_shift_vk(wParam) ? 1 : 0, m_bShiftPressed ? 1 : 0,
+               m_bOtherKeyPressed ? 1 : 0, m_bShiftPressedWithModifier ? 1 : 0);
     *pfEaten = FALSE;
 
     // 某些终端/宿主下可能不稳定触发 OnKeyUp，故在 OnTestKeyUp 提前执行一次切换。
@@ -787,7 +820,15 @@ void text_service::HandleSpace(ITfContext *pContext)
     else if (m_bInComposition)
     {
         // 如果没有候选词，插入原始输入
-        InsertText(pContext, m_compositionText);
+        if (zime::input_policy::is_temporary_raw_composition(
+                m_compositionText))
+        {
+            InsertRawText(pContext, m_compositionText);
+        }
+        else
+        {
+            InsertText(pContext, m_compositionText);
+        }
         ClearComposition();
         HideCandidates();
     }
@@ -852,7 +893,15 @@ void text_service::CommitFirstCandidateOrComposition(ITfContext *pContext)
         commit_text = m_compositionText;
     }
 
-    InsertText(pContext, commit_text);
+    if (commit_text == m_compositionText &&
+        zime::input_policy::is_temporary_raw_composition(m_compositionText))
+    {
+        InsertRawText(pContext, commit_text);
+    }
+    else
+    {
+        InsertText(pContext, commit_text);
+    }
     CancelCompositionInContext(pContext);
     ClearComposition();
     HideCandidates();

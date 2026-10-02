@@ -74,7 +74,17 @@ enum class ui_action_type : std::uint32_t
     status_change = 5,
     status_position = 6,
     status_menu_popup = 7,
+    candidate_menu_popup = 8,
 };
+
+inline bool is_candidate_ui_action(ui_action_type action)
+{
+    return action == ui_action_type::candidate_select ||
+        action == ui_action_type::candidate_page ||
+        action == ui_action_type::candidate_delete ||
+        action == ui_action_type::candidate_mark_uncommon ||
+        action == ui_action_type::candidate_menu_popup;
+}
 
 enum session_status_flag : std::uint32_t
 {
