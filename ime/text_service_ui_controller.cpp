@@ -1007,6 +1007,22 @@ void text_service::UpdateCandidateUIElement(ITfContext *pContext)
 
     const int candidate_count = m_candidateWindow.get_candidate_count();
 
+    // HandleCharacter clears the previous candidate snapshot before starting
+    // an asynchronous Broker query.  That temporary empty state is not the end
+    // of the candidate session.  Ending the UIElement here makes shell hosts
+    // close and immediately recreate their candidate presentation for every
+    // key, which is visible as flicker.  Once the matching Broker result
+    // arrives, an empty result is handled normally because the snapshot code
+    // then matches the current composition.
+    const bool candidate_result_pending =
+        candidate_count <= 0 &&
+        m_bInComposition &&
+        !m_compositionText.empty() &&
+        m_brokerClient.IsConnected() &&
+        m_brokerCandidateCode != m_compositionText;
+    if (candidate_result_pending)
+        return;
+
     if (!m_candidateUIElement)
     {
         m_candidateUIElement = new candidate_ui_element();
